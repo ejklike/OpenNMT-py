@@ -29,15 +29,6 @@ def build_embeddings(opt, text_field, for_encoder=True):
     """
     emb_dim = opt.src_word_vec_size if for_encoder else opt.tgt_word_vec_size
 
-    if opt.model_type == "vec" and for_encoder:
-        return VecEmbedding(
-            opt.feat_vec_size,
-            emb_dim,
-            position_encoding=opt.position_encoding,
-            dropout=(opt.dropout[0] if type(opt.dropout) is list
-                     else opt.dropout),
-        )
-
     pad_indices = [f.vocab.stoi[f.pad_token] for _, f in text_field]
     word_padding_idx, feat_pad_indices = pad_indices[0], pad_indices[1:]
 
@@ -71,8 +62,7 @@ def build_encoder(opt, embeddings):
         opt: the option in current environment.
         embeddings (Embeddings): vocab embeddings for this encoder.
     """
-    enc_type = opt.encoder_type if opt.model_type == "text" \
-        or opt.model_type == "vec" else opt.model_type
+    enc_type = opt.encoder_type
     return str2enc[enc_type].from_opt(opt, embeddings)
 
 
@@ -100,7 +90,7 @@ def load_test_model(opt, model_path=None):
     vocab = checkpoint['vocab']
     if inputters.old_style_vocab(vocab):
         fields = inputters.load_old_vocab(
-            vocab, opt.data_type, dynamic_dict=model_opt.copy_attn
+            vocab, dynamic_dict=model_opt.copy_attn
         )
     else:
         fields = vocab
@@ -139,11 +129,8 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None, gpu_id=None):
         model_opt.attention_dropout = model_opt.dropout
 
     # Build embeddings.
-    if model_opt.model_type == "text" or model_opt.model_type == "vec":
-        src_field = fields["src"]
-        src_emb = build_embeddings(model_opt, src_field)
-    else:
-        src_emb = None
+    src_field = fields["src"]
+    src_emb = build_embeddings(model_opt, src_field)
 
     # Build encoder.
     encoder = build_encoder(model_opt, src_emb)

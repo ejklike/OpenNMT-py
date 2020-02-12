@@ -52,7 +52,7 @@ def process_one_shard(corpus_params, params):
     assert len(src_shard) == len(tgt_shard)
     logger.info("Building shard %d." % i)
 
-    src_data = {"reader": src_reader, "data": src_shard, "dir": opt.src_dir}
+    src_data = {"reader": src_reader, "data": src_shard, "dir": None}
     tgt_data = {"reader": tgt_reader, "data": tgt_shard, "dir": None}
     align_data = {"reader": align_reader, "data": align_shard, "dir": None}
     _readers, _data, _dir = inputters.Dataset.config(
@@ -60,14 +60,12 @@ def process_one_shard(corpus_params, params):
 
     dataset = inputters.Dataset(
         fields, readers=_readers, data=_data, dirs=_dir,
-        sort_key=inputters.str2sortkey[opt.data_type],
+        sort_key=inputters.str2sortkey["text"],
         filter_pred=filter_pred
     )
     if corpus_type == "train" and existing_fields is None:
         for ex in dataset.examples:
             for name, field in fields.items():
-                if ((opt.data_type == "audio") and (name == "src")):
-                    continue
                 try:
                     f_iter = iter(field)
                 except TypeError:
@@ -177,7 +175,7 @@ def build_save_dataset(corpus_type, fields, src_reader, tgt_reader,
                     and tgt is not None):
                 filter_pred = partial(
                     inputters.filter_example,
-                    use_src_len=opt.data_type == "text",
+                    use_src_len=True,
                     max_src_len=opt.src_seq_length,
                     max_tgt_len=opt.tgt_seq_length)
             else:
@@ -206,7 +204,7 @@ def build_save_dataset(corpus_type, fields, src_reader, tgt_reader,
         vocab_path = opt.save_data + '.vocab.pt'
         if existing_fields is None:
             fields = _build_fields_vocab(
-                fields, counters, opt.data_type,
+                fields, counters, "text",
                 opt.share_vocab, opt.vocab_size_multiple,
                 opt.src_vocab_size, opt.src_words_min_frequency,
                 opt.tgt_vocab_size, opt.tgt_words_min_frequency)
@@ -217,7 +215,7 @@ def build_save_dataset(corpus_type, fields, src_reader, tgt_reader,
 
 def build_save_vocab(train_dataset, fields, opt):
     fields = inputters.build_vocab(
-        train_dataset, fields, opt.data_type, opt.share_vocab,
+        train_dataset, fields, "text", opt.share_vocab,
         opt.src_vocab, opt.src_vocab_size, opt.src_words_min_frequency,
         opt.tgt_vocab, opt.tgt_vocab_size, opt.tgt_words_min_frequency,
         vocab_size_multiple=opt.vocab_size_multiple
@@ -248,15 +246,14 @@ def preprocess(opt):
     src_nfeats = 0
     tgt_nfeats = 0
     for src, tgt in zip(opt.train_src, opt.train_tgt):
-        src_nfeats += count_features(src) if opt.data_type == 'text' \
-            else 0
+        src_nfeats += count_features(src)
         tgt_nfeats += count_features(tgt)  # tgt always text so far
     logger.info(" * number of source features: %d." % src_nfeats)
     logger.info(" * number of target features: %d." % tgt_nfeats)
 
     logger.info("Building `Fields` object...")
     fields = inputters.get_fields(
-        opt.data_type,
+        "text",
         src_nfeats,
         tgt_nfeats,
         dynamic_dict=opt.dynamic_dict,
@@ -264,7 +261,7 @@ def preprocess(opt):
         src_truncate=opt.src_seq_length_trunc,
         tgt_truncate=opt.tgt_seq_length_trunc)
 
-    src_reader = inputters.str2reader[opt.data_type].from_opt(opt)
+    src_reader = inputters.str2reader["text"].from_opt(opt)
     tgt_reader = inputters.str2reader["text"].from_opt(opt)
     align_reader = inputters.str2reader["text"].from_opt(opt)
 

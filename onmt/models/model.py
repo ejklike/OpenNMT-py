@@ -24,8 +24,7 @@ class NMTModel(nn.Module):
         Args:
             src (Tensor): A source sequence passed to encoder.
                 typically for inputs this will be a padded `LongTensor`
-                of size ``(len, batch, features)``. However, may be an
-                image or other generic input depending on encoder.
+                of size ``(len, batch, features)``.
             tgt (LongTensor): A target sequence passed to decoder.
                 Size ``(tgt_len, batch, features)``.
             lengths(LongTensor): The src lengths, pre-padding ``(batch,)``.

@@ -64,8 +64,7 @@ def main(opt, device_id, batch_queue=None, semaphore=None):
     # check for code where vocab is saved instead of fields
     # (in the future this will be done in a smarter way)
     if old_style_vocab(vocab):
-        fields = load_old_vocab(
-            vocab, opt.model_type, dynamic_dict=opt.copy_attn)
+        fields = load_old_vocab(vocab, dynamic_dict=opt.copy_attn)
     else:
         fields = vocab
 

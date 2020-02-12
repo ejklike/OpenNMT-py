@@ -25,8 +25,6 @@ def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
         model (:obj:`onmt.models.NMTModel`): the model to train
         fields (dict): dict of fields
         optim (:obj:`onmt.utils.Optimizer`): optimizer used during training
-        data_type (str): string describing the type of data
-            e.g. "text", "img", "audio"
         model_saver(:obj:`onmt.models.ModelSaverBase`): the utility object
             used to save the model
     """
@@ -89,7 +87,6 @@ class Trainer(object):
                the optimizer responsible for update
             trunc_size(int): length of truncated back propagation through time
             shard_size(int): compute loss in shards of this size for efficiency
-            data_type(string): type of the source input: [text|img|audio]
             norm_method(string): normalization methods: [sents|tokens]
             accum_count(list): accumulate gradients this many times.
             accum_steps(list): steps for accum gradients changes.

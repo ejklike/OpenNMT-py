@@ -229,7 +229,7 @@ class Translator(object):
             logger (logging.Logger or NoneType): See :func:`__init__()`.
         """
 
-        src_reader = inputters.str2reader[opt.data_type].from_opt(opt)
+        src_reader = inputters.str2reader["text"].from_opt(opt)
         tgt_reader = inputters.str2reader["text"].from_opt(opt)
         return cls(
             model,
@@ -250,7 +250,6 @@ class Translator(object):
             ignore_when_blocking=set(opt.ignore_when_blocking),
             replace_unk=opt.replace_unk,
             phrase_table=opt.phrase_table,
-            data_type=opt.data_type,
             verbose=opt.verbose,
             report_time=opt.report_time,
             copy_attn=model_opt.copy_attn,
@@ -282,7 +281,6 @@ class Translator(object):
             self,
             src,
             tgt=None,
-            src_dir=None,
             batch_size=None,
             batch_type="sents",
             attn_debug=False,
@@ -293,8 +291,6 @@ class Translator(object):
         Args:
             src: See :func:`self.src_reader.read()`.
             tgt: See :func:`self.tgt_reader.read()`.
-            src_dir: See :func:`self.src_reader.read()` (only relevant
-                for certain types of data).
             batch_size (int): size of examples per mini-batch
             attn_debug (bool): enables the attention logging
             align_debug (bool): enables the word alignment logging
@@ -310,7 +306,7 @@ class Translator(object):
         if batch_size is None:
             raise ValueError("batch_size must be set")
 
-        src_data = {"reader": self.src_reader, "data": src, "dir": src_dir}
+        src_data = {"reader": self.src_reader, "data": src, "dir": None}
         tgt_data = {"reader": self.tgt_reader, "data": tgt, "dir": None}
         _readers, _data, _dir = inputters.Dataset.config(
             [('src', src_data), ('tgt', tgt_data)])
