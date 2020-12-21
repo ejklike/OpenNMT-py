@@ -1,0 +1,4745 @@
+#==================================================================
+# make_dataset.py
+#==================================================================
+from rdkit import Chem
+import re
+
+
+def disable_rdkit_log():
+    from rdkit import RDLogger
+    RDLogger.DisableLog('rdApp.*')
+
+
+def smi_tokenizer(smi):
+    """
+    Tokenize a SMILES molecule or reaction
+    (https://github.com/pschwllr/MolecularTransformer)
+    """
+    pattern =  "(\[[^\]]+]|Br?|Cl?|N|O|S|P|F|I|b|c|n|o|s|p|\(|\)|\.|=|#|-|\+|\\\\|\/|:|~|@|\?|>|\*|\$|\%[0-9]{2}|[0-9])"
+    regex = re.compile(pattern)
+    tokens = [token for token in regex.findall(smi)]
+    assert smi == ''.join(tokens)
+    return ' '.join(tokens)
+
+        
+def canonicalize_smiles(smi):
+    disable_rdkit_log()
+    mol = Chem.MolFromSmiles(smi)
+    if mol is not None:
+        for atom in mol.GetAtoms():
+            atom.SetAtomMapNum(0)
+        ini_smi = Chem.MolToSmiles(mol, isomericSmiles=True)
+        return '.'.join(sorted(ini_smi.split('.')))
+    else:
+        return ''
+
+
+def get_tokenized_smiles_and_numbering(smi):
+    mol = Chem.MolFromSmiles(smi)
+    if mol is not None:
+        for atom in mol.GetAtoms():
+            atom.SetAtomMapNum(0)
+    smi_nonum = Chem.MolToSmiles(mol, isomericSmiles=True)
+    
+    smi_tokens = smi_tokenizer(smi).split()
+    smi_nonum_tokens = smi_tokenizer(smi_nonum).split()
+    numbering = [x.split(':')[1].replace(']', '') if ':' in x else ''
+                 for x in smi_tokens]
+#     print(list(zip(smi_nonum_tokens, numbering)))
+    return list(zip(smi_nonum_tokens, numbering))
+
+
+dictionary = {
+    'OH': 'O', 
+    'OH2': 'O',
+    'cH': 'c',
+    'CH': 'C',
+    'CH2': 'C',
+    'CH3': 'C',
+    'N': 'N',
+    'NH': 'N',
+    'NH2': 'N',
+    'NH3': '[NH3]',
+    'nH': '[nH]',
+    'nH2': '[nH2]',
+    'nH3': '[nH3]',
+#     'SH': '[SH]',
+#     'PH': '[PH]',
+    'SH': 'S',
+    'PH': 'P',
+    'PH2': '[PH2]',
+    'PH4': '[PH4]',
+    'Si': '[Si]',
+    'SiH': '[SiH]',
+    'SiH2': '[SiH2]',
+    'C@@H': '[C@@H]',
+    'C@H': '[C@H]',
+    'C@': '[C@]',
+    'C@@': '[C@@]',
+    'S@': '[S@]',
+    'S@@': '[S@@]',
+    'N@@+': '[N@@+]',
+    'C-': '[C-]',
+    'C+': '[C+]',
+    'P-': '[P-]',
+    'P+': '[P+]',
+    'S-': '[S-]',
+    'S+': '[S+]',
+    's-': '[s-]',
+    's+': '[s+]',
+    'N-': '[N-]',
+    'N+': '[N+]',
+    'n-': '[n-]',
+    'n+': '[n+]',
+    'NH2+': '[NH2+]',
+    'NH3+': '[NH3+]',
+    'NH4+': '[NH4+]',
+    'O-': '[O-]',
+    'BrH': 'Br',
+    'IH': 'I',
+    'ClH': 'Cl',
+    'se': '[se]',
+    'Sn': '[Sn]',
+    'Se': '[Se]',
+    'SnH': '[SnH]',
+    'SiH3': '[SiH3]'
+}
+
+def get_token_and_number_pairs(smi):
+    tokens = smi_tokenizer(smi).split()
+    pairs = []
+    for t in tokens:
+        if ':' not in t:
+            t, n = t, ''
+        else:
+#             try:
+            t, n = re.findall(r"\[(.+?):([0-9]+?)\]", t)[0]
+#             except:
+#                 print(t, smi)
+            t = dictionary.get(t, t)
+
+#             as_is_list = set("Br Cl N O S P F I b c n o s p ( ) . = # - + \\ / : ~ @ ? > * $".split())
+#             t = (t if t in as_is_list else '[%s]'%t)
+        pairs.append((t, n))
+    return pairs
+
+# i = 48995
+# x = df.loc[i].prd
+# x_orig = df.loc[i].prod_smiles
+# # for t, t1, (t2, n) in zip(smi_tokenizer(canonicalize_smiles(x)).split(), 
+# #                           smi_tokenizer(x).split(), 
+# #                           get_token_and_number_pairs(x)):
+# #     print('**********' if t2 != t else '', t, t1, t2)
+# # print(x)
+# print('origin      : ', x_orig)
+# print('canon       : ', canonicalize_smiles(x_orig))
+# x_custom = ''.join(list(zip(*get_token_and_number_pairs(x)))[0])
+# print('custom_canon: ', canonicalize_smiles(x_custom))
+# print('custom      : ', x_custom)
+# print()
+# print(x)
+# # print(Chem.MolFromSmiles(x) == Chem.MolFromSmiles(x_custom))
+
+
+import numpy as np
+
+def split_data_df(data, val_frac=0.1, test_frac=0.1, shuffle=False, seed=None):
+    # Define shuffling
+    if shuffle:
+        if seed is None:
+            np.random.seed(int(time.time()))
+        else:
+            np.random.seed(seed)
+        def shuffle_func(x):
+            np.random.shuffle(x)
+    else:
+        def shuffle_func(x):
+            pass
+
+    # Go through each class
+    classes = sorted(np.unique(data['class']))
+    for class_ in classes:
+        indeces = data.loc[data['class'] == class_].index
+        N = len(indeces)
+        print('{} rows with class value {}'.format(N, class_))
+
+        shuffle_func(indeces)
+        train_end = int((1.0 - val_frac - test_frac) * N)
+        val_end = int((1.0 - test_frac) * N)
+
+        for i in indeces[:train_end]:
+            data.set_value(i, 'dataset', 'train')
+        for i in indeces[train_end:val_end]:
+            data.set_value(i, 'dataset', 'val')
+        for i in indeces[val_end:]:
+            data.set_value(i, 'dataset', 'test')
+    print(data['dataset'].value_counts())
+
+
+
+import pandas as pd
+
+df = pd.read_csv('data_processed.csv', index_col=0)
+
+del df['id'], df['prod_smiles_pop'], df['keep']
+
+df['prd'] = df['rxn_smiles'].apply(lambda x: x.split('>>')[1])
+df['rct'] = df['rxn_smiles'].apply(lambda x: x.split('>>')[0])
+df['prd_tok_num_pairs'] = df['prd'].apply(lambda x: get_token_and_number_pairs(x))
+df['rct_tok_num_pairs'] = df['rct'].apply(lambda x: get_token_and_number_pairs(x))
+# df['prd_smiles'] = df['prd_tok_num_pairs'].apply(lambda x: ''.join(list(zip(*x))[0]))
+# df['rct_smiles'] = df['rct_tok_num_pairs'].apply(lambda x: ''.join(list(zip(*x))[0]))
+# df['prd_smiles_can'] = df['prd_smiles'].apply(lambda x: canonicalize_smiles(x))
+# df['rct_smiles_can'] = df['rct_smiles'].apply(lambda x: canonicalize_smiles(x))
+
+df['prd_tok'] = df['prd_tok_num_pairs'].apply(lambda x: ' '.join(list(zip(*x))[0]))
+df['rct_tok'] = df['rct_tok_num_pairs'].apply(lambda x: ' '.join(list(zip(*x))[0]))
+df['prd_num'] = df['prd_tok_num_pairs'].apply(lambda x: ' '.join(['0' if a == '' else a for a in list(zip(*x))[1]]))
+df['rct_num'] = df['rct_tok_num_pairs'].apply(lambda x: ' '.join(['0' if a == '' else a for a in list(zip(*x))[1]]))
+
+def get_index_tokens(prd_num, rct_num):
+    ref_numbers = {k: i+1 for i, k in enumerate(prd_num.split()) if k != '0'}
+    out_numbers = [ref_numbers[k] if k != '0' else 0 for k in rct_num.split()]
+    return ' '.join([str(x) for x in out_numbers])
+
+df['num_tok'] = df.apply(lambda x: get_index_tokens(x['prd_num'], x['rct_num']), axis=1)
+
+split_data_df(df)
+
+for split in df['dataset'].unique():
+    data_split = df[df['dataset'] == split]
+    data_split['prd_tok'].to_csv('src-tok-{}.txt'.format(split), header=None, index=None)
+    data_split['rct_tok'].to_csv('tgt-tok-{}.txt'.format(split), header=None, index=None)
+    data_split['num_tok'].to_csv('tgt-idx-{}.txt'.format(split), header=None, index=None)
+    data_split['rxn_smiles'].to_csv('rxn-{}.txt'.format(split), header=None, index=None)
+    
+#     data_split['prd_num'].to_csv('src-num-{}.txt'.format(split), header=None, index=None)
+#     data_split['rct_num'].to_csv('tgt-num-{}.txt'.format(split), header=None, index=None)
+
+for split in df['dataset'].unique():
+    data_split = df[(df['dataset'] == split) & 
+                    (df['prd_tok'].apply(lambda x: len(x)) < 30) & 
+                    (df['rct_tok'].apply(lambda x: len(x)) < 30)]
+    print(len(data_split))
+    data_split['prd_tok'].to_csv('toy-src-tok-{}.txt'.format(split), header=None, index=None)
+    data_split['rct_tok'].to_csv('toy-tgt-tok-{}.txt'.format(split), header=None, index=None)
+    data_split['num_tok'].to_csv('toy-tgt-idx-{}.txt'.format(split), header=None, index=None)
+    data_split['rxn_smiles'].to_csv('toy-rxn-{}.txt'.format(split), header=None, index=None)
+
+#==================================================================
+# opts.py
+    group.add('--train_idx', '-train_idx', required=True, nargs='+',
+              help="Path(s) to the training target idx data")
+
+    group.add('--train_align', '-train_align', nargs='+', default=[None],
+              help="Path(s) to the training src-tgt alignment")
+    group.add('--train_ids', '-train_ids', nargs='+', default=[None],
+              help="ids to name training shards, used for corpus weighting")
+
+    group.add('--valid_src', '-valid_src',
+              help="Path to the validation source data")
+    group.add('--valid_tgt', '-valid_tgt',
+              help="Path to the validation target data")
+    group.add('--valid_idx', '-valid_idx',
+              help="Path to the validation target data")
+#==================================================================
+# trainer.py
+"""
+    This is the loadable seq2seq trainer library that is
+    in charge of training details, loss compute, and statistics.
+    See train.py for a use case of this library.
+
+    Note: To make this a general library, we implement *only*
+          mechanism things here(i.e. what to do), and leave the strategy
+          things to users(i.e. how to do it). Also see train.py(one of the
+          users of this library) for the strategy things we do.
+"""
+
+import torch
+import traceback
+import numpy as np
+np.set_printoptions(precision=3)
+
+import onmt.utils
+from onmt.utils.logging import logger
+
+torch.autograd.set_detect_anomaly(True)
+
+
+
+def compute_loss(output, target, criterion, 
+                 reduce_sum=True, get_stat=True):
+    def _bottle(_v):
+        return _v.view(-1, _v.size(2))
+
+    seqlen, batch_size, _ = output.size()
+    bottled_output = _bottle(output)
+
+    scores = bottled_output
+    gtruth = target.view(-1)                # L*B
+
+    loss = criterion(scores, gtruth) # L*B
+
+    ## for stats
+    if reduce_sum:
+        loss = loss.sum()
+    else:
+        loss = loss.view(seqlen, batch_size, 1)
+
+    stat_dict = {}
+    if get_stat:
+        pred = scores.max(1)[1]
+        non_padding = gtruth.ne(criterion.ignore_index)
+        correct = pred.eq(gtruth) * non_padding # L*B
+        stat_dict = {
+            'n_correct': correct.sum().item(),
+            'n_words': non_padding.sum().item()}
+
+    return loss, stat_dict
+
+
+def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
+    """
+    Simplify `Trainer` creation based on user `opt`s*
+
+    Args:
+        opt (:obj:`Namespace`): user options (usually from argument parsing)
+        model (:obj:`onmt.models.NMTModel`): the model to train
+        fields (dict): dict of fields
+        optim (:obj:`onmt.utils.Optimizer`): optimizer used during training
+        data_type (str): string describing the type of data
+            e.g. "text", "img", "audio"
+        model_saver(:obj:`onmt.models.ModelSaverBase`): the utility object
+            used to save the model
+    """
+    tgt_field = dict(fields)["tgt"].base_field
+    train_loss = onmt.utils.loss.build_loss_compute(model, tgt_field, opt)
+    valid_loss = onmt.utils.loss.build_loss_compute(model, tgt_field, opt)
+
+    trunc_size = opt.truncated_decoder  # Badly named...
+    shard_size = opt.max_generator_batches if opt.model_dtype == 'fp32' else 0
+    norm_method = opt.normalization
+    accum_count = opt.accum_count
+    accum_steps = opt.accum_steps
+    n_gpu = opt.world_size
+    average_decay = opt.average_decay
+    average_every = opt.average_every
+    dropout = opt.dropout
+    dropout_steps = opt.dropout_steps
+    if device_id >= 0:
+        gpu_rank = opt.gpu_ranks[device_id]
+    else:
+        gpu_rank = 0
+        n_gpu = 0
+    gpu_verbose_level = opt.gpu_verbose_level
+
+    earlystopper = onmt.utils.EarlyStopping(
+        opt.early_stopping, scorers=onmt.utils.scorers_from_opts(opt)) \
+        if opt.early_stopping > 0 else None
+    
+    report_manager = onmt.utils.build_report_manager(opt, gpu_rank)
+    trainer = onmt.Trainer(model, train_loss, valid_loss, optim, trunc_size,
+                           shard_size, norm_method,
+                           accum_count, accum_steps,
+                           n_gpu, gpu_rank,
+                           gpu_verbose_level, report_manager,
+                           with_align=True if opt.lambda_align > 0 else False,
+                           model_saver=model_saver if gpu_rank == 0 else None,
+                           average_decay=average_decay,
+                           average_every=average_every,
+                           model_dtype=opt.model_dtype,
+                           earlystopper=earlystopper,
+                           dropout=dropout,
+                           dropout_steps=dropout_steps,
+                           source_noise=None,
+                           tgt_field=tgt_field)
+    return trainer
+
+
+class Trainer(object):
+    """
+    Class that controls the training process.
+
+    Args:
+            model(:py:class:`onmt.models.model.NMTModel`): translation model
+                to train
+            train_loss(:obj:`onmt.utils.loss.LossComputeBase`):
+               training loss computation
+            valid_loss(:obj:`onmt.utils.loss.LossComputeBase`):
+               training loss computation
+            optim(:obj:`onmt.utils.optimizers.Optimizer`):
+               the optimizer responsible for update
+            trunc_size(int): length of truncated back propagation through time
+            shard_size(int): compute loss in shards of this size for efficiency
+            data_type(string): type of the source input: [text|img|audio]
+            norm_method(string): normalization methods: [sents|tokens]
+            accum_count(list): accumulate gradients this many times.
+            accum_steps(list): steps for accum gradients changes.
+            report_manager(:obj:`onmt.utils.ReportMgrBase`):
+                the object that creates reports, or None
+            model_saver(:obj:`onmt.models.ModelSaverBase`): the saver is
+                used to save a checkpoint.
+                Thus nothing will be saved if this parameter is None
+    """
+
+    def __init__(self, model, train_loss, valid_loss, optim,
+                 trunc_size=0, shard_size=32,
+                 norm_method="sents", accum_count=[1],
+                 accum_steps=[0],
+                 n_gpu=1, gpu_rank=1, gpu_verbose_level=0,
+                 report_manager=None, with_align=False, model_saver=None,
+                 average_decay=0, average_every=1, model_dtype='fp32',
+                 earlystopper=None, dropout=[0.3], dropout_steps=[0],
+                 source_noise=None, tgt_field=None):
+        # Basic attributes.
+        self.model = model
+        self.train_loss = train_loss
+        self.valid_loss = valid_loss
+        self.optim = optim
+        self.trunc_size = trunc_size
+        self.shard_size = shard_size
+        self.norm_method = norm_method
+        self.accum_count_l = accum_count
+        self.accum_count = accum_count[0]
+        self.accum_steps = accum_steps
+        self.n_gpu = n_gpu
+        self.gpu_rank = gpu_rank
+        self.gpu_verbose_level = gpu_verbose_level
+        self.report_manager = report_manager
+        self.with_align = with_align
+        self.model_saver = model_saver
+        self.average_decay = average_decay
+        self.moving_average = None
+        self.average_every = average_every
+        self.model_dtype = model_dtype
+        self.earlystopper = earlystopper
+        self.dropout = dropout
+        self.dropout_steps = dropout_steps
+        self.source_noise = source_noise
+
+        pad_idx = tgt_field.vocab.stoi[tgt_field.pad_token]
+        self.criterion_gen = torch.nn.NLLLoss(
+            ignore_index=pad_idx, reduction='none')
+        self.criterion_cop = torch.nn.CrossEntropyLoss(
+            ignore_index=-1, reduction='none')
+        self.criterion_pgen = torch.nn.BCELoss(reduction='none')
+
+        self.tgt_field = tgt_field
+        for i in range(len(self.accum_count_l)):
+            assert self.accum_count_l[i] > 0
+            if self.accum_count_l[i] > 1:
+                assert self.trunc_size == 0, \
+                    """To enable accumulated gradients,
+                       you must disable target sequence truncating."""
+
+        # Set model in training mode.
+        self.model.train()
+
+    def _accum_count(self, step):
+        for i in range(len(self.accum_steps)):
+            if step > self.accum_steps[i]:
+                _accum = self.accum_count_l[i]
+        return _accum
+
+    def _maybe_update_dropout(self, step):
+        for i in range(len(self.dropout_steps)):
+            if step > 1 and step == self.dropout_steps[i] + 1:
+                self.model.update_dropout(self.dropout[i])
+                logger.info("Updated dropout to %f from step %d"
+                            % (self.dropout[i], step))
+
+    def _accum_batches(self, iterator):
+        batches = []
+        normalization = 0
+        self.accum_count = self._accum_count(self.optim.training_step)
+        for batch in iterator:
+            batches.append(batch)
+            if self.norm_method == "tokens":
+                num_tokens = batch.tgt[0][1:, :, 0].ne(
+                    self.train_loss.padding_idx).sum()
+                normalization += num_tokens.item()
+            else:
+                normalization += batch.batch_size
+            if len(batches) == self.accum_count:
+                yield batches, normalization
+                self.accum_count = self._accum_count(self.optim.training_step)
+                batches = []
+                normalization = 0
+        if batches:
+            yield batches, normalization
+
+    def _update_average(self, step):
+        if self.moving_average is None:
+            copy_params = [params.detach().float()
+                           for params in self.model.parameters()]
+            self.moving_average = copy_params
+        else:
+            average_decay = max(self.average_decay,
+                                1 - (step + 1)/(step + 10))
+            for (i, avg), cpt in zip(enumerate(self.moving_average),
+                                     self.model.parameters()):
+                self.moving_average[i] = \
+                    (1 - average_decay) * avg + \
+                    cpt.detach().float() * average_decay
+
+    def train(self,
+              train_iter,
+              train_steps,
+              save_checkpoint_steps=5000,
+              valid_iter=None,
+              valid_steps=10000):
+        """
+        The main training loop by iterating over `train_iter` and possibly
+        running validation on `valid_iter`.
+
+        Args:
+            train_iter: A generator that returns the next training batch.
+            train_steps: Run training for this many iterations.
+            save_checkpoint_steps: Save a checkpoint every this many
+              iterations.
+            valid_iter: A generator that returns the next validation batch.
+            valid_steps: Run evaluation every this many iterations.
+
+        Returns:
+            The gathered statistics.
+        """
+        if valid_iter is None:
+            logger.info('Start training loop without validation...')
+        else:
+            logger.info('Start training loop and validate every %d steps...',
+                        valid_steps)
+
+        total_stats = onmt.utils.Statistics()
+        report_stats = onmt.utils.Statistics()
+        self._start_report_manager(start_time=total_stats.start_time)
+
+        for i, (batches, normalization) in enumerate(
+                self._accum_batches(train_iter)):
+            step = self.optim.training_step
+            # UPDATE DROPOUT
+            self._maybe_update_dropout(step)
+
+            if self.gpu_verbose_level > 1:
+                logger.info("GpuRank %d: index: %d", self.gpu_rank, i)
+            if self.gpu_verbose_level > 0:
+                logger.info("GpuRank %d: reduce_counter: %d \
+                            n_minibatch %d"
+                            % (self.gpu_rank, i + 1, len(batches)))
+
+            if self.n_gpu > 1:
+                normalization = sum(onmt.utils.distributed
+                                    .all_gather_list(normalization))
+                
+            self._gradient_accumulation(
+                batches, normalization, total_stats, report_stats)
+
+            if self.average_decay > 0 and i % self.average_every == 0:
+                self._update_average(step)
+
+            report_stats = self._maybe_report_training(
+                step, train_steps,
+                self.optim.learning_rate(),
+                report_stats)
+
+            if valid_iter is not None and step % valid_steps == 0:
+                if self.gpu_verbose_level > 0:
+                    logger.info('GpuRank %d: validate step %d'
+                                % (self.gpu_rank, step))
+                valid_stats = self.validate(
+                    valid_iter, moving_average=self.moving_average)
+                if self.gpu_verbose_level > 0:
+                    logger.info('GpuRank %d: gather valid stat \
+                                step %d' % (self.gpu_rank, step))
+                valid_stats = self._maybe_gather_stats(valid_stats)
+                if self.gpu_verbose_level > 0:
+                    logger.info('GpuRank %d: report stat step %d'
+                                % (self.gpu_rank, step))
+                self._report_step(self.optim.learning_rate(),
+                                  step, valid_stats=valid_stats)
+                # Run patience mechanism
+                if self.earlystopper is not None:
+                    self.earlystopper(valid_stats, step)
+                    # If the patience has reached the limit, stop training
+                    if self.earlystopper.has_stopped():
+                        break
+
+            if (self.model_saver is not None
+                and (save_checkpoint_steps != 0
+                     and step % save_checkpoint_steps == 0)):
+                self.model_saver.save(step, moving_average=self.moving_average)
+
+            if train_steps > 0 and step >= train_steps:
+                break
+
+        if self.model_saver is not None:
+            self.model_saver.save(step, moving_average=self.moving_average)
+        return total_stats
+
+    def validate(self, valid_iter, moving_average=None):
+        """ Validate model.
+            valid_iter: validate data iterator
+        Returns:
+            :obj:`nmt.Statistics`: validation loss statistics
+        """
+        if moving_average:
+            # swap model params w/ moving average
+            # (and keep the original parameters)
+            model_params_data = []
+            for avg, param in zip(self.moving_average,
+                                  self.model.parameters()):
+                model_params_data.append(param.data)
+                param.data = avg.data.half() if self.optim._fp16 == "legacy" \
+                    else avg.data
+
+        # Set model in validating mode.
+        self.model.eval()
+
+        with torch.no_grad():
+            stats = onmt.utils.Statistics()
+
+            for batch in valid_iter:
+                valid_loss, valid_stats = self.get_loss_stats(batch)
+                stats.update(valid_stats)
+
+        if moving_average:
+            for param_data, param in zip(model_params_data,
+                                         self.model.parameters()):
+                param.data = param_data
+
+        # Set model back to training mode.
+        self.model.train()
+
+        return stats
+
+    def get_loss_stats(self, batch):
+        src, src_lengths = batch.src # (SL, B, 1)
+        tgt, tgt_lengths = batch.tgt # (TL, B, 1)
+        idx, _ = batch.idx           # (TL, B, 1)
+        
+        # -100: pad / 0: gen / 1~: copy
+        nonpad_mask = (tgt != 1).long()
+        idx_pad = idx * nonpad_mask + (-100) * (1-nonpad_mask)
+        # * nonpad_mask + (-100) * (1-nonpad_mask)
+        
+        p_gen, log_vocab_dist, attn_dist_logit = self.model(src, src_lengths, tgt, idx)
+        # p_gen      : (TL-1, B, 1)
+        # vocab_dist : (TL-1, B, V)   | tgt[1:] : (TL-1, B, 1)
+        # a_copy     : (TL-1, B, SL-2)  | idx[1:] : (TL-1, B, 1)
+        ##################################################################
+        # ===src===
+        # 2,  5,  6,  4,  8,  4,  4,  4,  6,  9,  7,  4,  4,  8,
+        # ===tgt===
+        # 2,  9, 11,  5,  4,  8,  4,  4,  4,  6,  9,  3,  1,  1,
+        # ===idx===
+        # 0,  0,  0,  1,  3,  0,  5,  6,  7,  0,  9,  0,  0,  0,
+        # is_gen
+        # 1,  1,  1,  0,  0,  1,  0,  0,  0,  1,  0,  1,  0,  0,
+        # nonpad_mask
+        # 1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  0,  0,
+        # idx_shifted
+        # 0,  0,  0,  1,  3,  0,  5,  6,  7,  0,  9,  0,  0,  0,   ==> -1씩
+        ##################################################################
+        
+        # idx_pad
+        # 0,  0,  0,  1,  3,  0,  5,  6,  7,  0,  9,  0,-100,-100,
+        ##################################################################
+
+        ###### GEN OR COP LOSS
+        # p_gen      : (TL-1, B, 1)
+        # is_gen     : (TL, B, 1)
+        is_gen = (idx == 0).float()
+        loss_pgen = (
+            self.criterion_pgen(p_gen, is_gen[1:]) * nonpad_mask[1:]
+        ).sum()
+
+        ###### IDX COP LOSS <- idx -1 to ignore (including padding)
+        # is_cop     : (TL, B, 1)
+        # idx        : (TL, B, 1) ==> having values in [1, ..., SL-2] + [0]
+        # idx_shifted: (TL, B, 1) ==> having values in [0, ..., SL-3] + [-1]
+        # attn_dist  : (TL-1, B, SL-2)
+        idx_shifted = idx - 1 # -1 to ignore, max=SL-3
+        loss_idx, stat_dict_idx = compute_loss(
+            attn_dist_logit, idx_shifted[1:], self.criterion_cop, 
+            reduce_sum=True, get_stat=True)
+
+        # # assert
+        # print(src.shape, src[:, -1, 0])
+        # print(idx.shape, idx[:, -1, 0])
+        # print(tgt.shape, tgt[:, -1, 0])
+        # copied_tgt = src.gather(dim=0, index=idx) * (idx != 0).long()
+        # print(copied_tgt.shape, copied_tgt[:, -1, 0])
+        # assert False
+
+        """ 1) gen only
+        ###### VOCAB LOSS <- idx 1 to ignore
+        # tgt_gen_only : (TL, B, 1)
+        # vocab_dist   : (TL-1, B, V)
+        tgt_gen_only = tgt * is_gen.long() + 1 * (1-is_gen.long())
+        loss_voc, stat_dict_voc = compute_loss(
+            log_vocab_dist, tgt_gen_only[1:], self.criterion_gen, 
+            reduce_sum=True, get_stat=True)
+        """
+
+        """ 2) gen + copy"""
+        ###### VOCAB LOSS <- idx 1 to ignore
+        # tgt_gen_only : (TL, B, 1)
+        # vocab_dist   : (TL-1, B, V)
+
+
+        # vocab_dist_gen = vocab_dist
+        # vocab_dist_cop = torch.zeros(vocab_dist.size(), 
+        #                              dtype=vocab_dist.dtype, 
+        #                              device=vocab_dist.device)
+        # src_tr = src.transpose(0, 2).repeat(tgt.size(0)-1, 1, 1)
+        
+        # # COP 1
+        # a_copy_masked = (1-is_gen[1:]) * a_copy # (TL-1, B, SL)
+        # gen_mask = is_gen.eq(1)
+        # attn_dist_logit = attn_dist_logit.masked_fill_(gen_mask, 0)
+        # vocab_dist_cop = log_vocab_dist.scatter_add(2, src_tr, a_copy_masked)
+
+
+        # print(vocab_dist_ge)
+
+        print('tgt   ', tgt.squeeze())
+        print('is_gen', is_gen.squeeze())
+        print('log_vocab_dist', log_vocab_dist.squeeze())
+        print('attn_dist_logit', attn_dist_logit.squeeze())
+        raise
+
+
+        tgt_gen_only = tgt * is_gen.long() + 1 * (1-is_gen.long())
+        loss_voc, stat_dict_voc = compute_loss(
+            log_vocab_dist, tgt_gen_only[1:], self.criterion_gen, 
+            reduce_sum=True, get_stat=True)
+        
+        loss = loss_pgen + loss_idx + loss_voc
+        stat_dict = {k: stat_dict_idx[k] + stat_dict_voc[k] 
+                     for k in stat_dict_idx.keys()}
+
+        stats = onmt.utils.Statistics(loss=loss.item(),
+                                      **stat_dict)
+        return loss, stats
+        
+    def _gradient_accumulation(self, true_batches, normalization, 
+                               total_stats, report_stats):
+        if self.accum_count > 1:
+            self.optim.zero_grad()
+
+        for k, batch in enumerate(true_batches):
+
+            if self.accum_count == 1:
+                self.optim.zero_grad()
+
+            # gradient accumulation
+            loss, stats = self.get_loss_stats(batch)
+            self.optim.backward(loss)
+
+            # update stats
+            total_stats.update(stats)
+            report_stats.update(stats)
+
+            # Update the parameters and statistics.
+            if self.accum_count == 1:
+                # Multi GPU gradient gather
+                if self.n_gpu > 1:
+                    grads = [p.grad.data for p in self.model.parameters()
+                             if p.requires_grad and p.grad is not None]
+                    onmt.utils.distributed.all_reduce_and_rescale_tensors(
+                        grads, float(1))
+                self.optim.step()
+
+        # in case of multi step gradient accumulation,
+        # update only after accum batches
+        if self.accum_count > 1:
+            if self.n_gpu > 1:
+                grads = [p.grad.data for p in self.model.parameters()
+                         if p.requires_grad and p.grad is not None]
+                onmt.utils.distributed.all_reduce_and_rescale_tensors(
+                    grads, float(1))
+            self.optim.step()
+
+    def _start_report_manager(self, start_time=None):
+        """
+        Simple function to start report manager (if any)
+        """
+        if self.report_manager is not None:
+            if start_time is None:
+                self.report_manager.start()
+            else:
+                self.report_manager.start_time = start_time
+
+    def _maybe_gather_stats(self, stat):
+        """
+        Gather statistics in multi-processes cases
+
+        Args:
+            stat(:obj:onmt.utils.Statistics): a Statistics object to gather
+                or None (it returns None in this case)
+
+        Returns:
+            stat: the updated (or unchanged) stat object
+        """
+        if stat is not None and self.n_gpu > 1:
+            return onmt.utils.Statistics.all_gather_stats(stat)
+        return stat
+
+    def _maybe_report_training(self, step, num_steps, learning_rate,
+                               report_stats):
+        """
+        Simple function to report training stats (if report_manager is set)
+        see `onmt.utils.ReportManagerBase.report_training` for doc
+        """
+        if self.report_manager is not None:
+            return self.report_manager.report_training(
+                step, num_steps, learning_rate, report_stats,
+                multigpu=self.n_gpu > 1)
+
+    def _report_step(self, learning_rate, step, train_stats=None,
+                     valid_stats=None):
+        """
+        Simple function to report stats (if report_manager is set)
+        see `onmt.utils.ReportManagerBase.report_step` for doc
+        """
+        if self.report_manager is not None:
+            return self.report_manager.report_step(
+                learning_rate, step, train_stats=train_stats,
+                valid_stats=valid_stats)
+#==================================================================
+# preprocess.py
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+    Pre-process Data / features files and build vocabulary
+"""
+import codecs
+import glob
+import gc
+import torch
+from collections import Counter, defaultdict
+
+from onmt.utils.logging import init_logger, logger
+from onmt.utils.misc import split_corpus
+import onmt.inputters as inputters
+import onmt.opts as opts
+from onmt.utils.parse import ArgumentParser
+from onmt.inputters.inputter import _build_fields_vocab,\
+                                    _load_vocab, \
+                                    old_style_vocab, \
+                                    load_old_vocab
+
+from functools import partial
+from multiprocessing import Pool
+
+
+def check_existing_pt_files(opt, corpus_type, ids, existing_fields):
+    """ Check if there are existing .pt files to avoid overwriting them """
+    existing_shards = []
+    for maybe_id in ids:
+        if maybe_id:
+            shard_base = corpus_type + "_" + maybe_id
+        else:
+            shard_base = corpus_type
+        pattern = opt.save_data + '.{}.*.pt'.format(shard_base)
+        if glob.glob(pattern):
+            if opt.overwrite:
+                maybe_overwrite = ("will be overwritten because "
+                                   "`-overwrite` option is set.")
+            else:
+                maybe_overwrite = ("won't be overwritten, pass the "
+                                   "`-overwrite` option if you want to.")
+            logger.warning("Shards for corpus {} already exist, {}"
+                           .format(shard_base, maybe_overwrite))
+            existing_shards += [maybe_id]
+    return existing_shards
+
+
+def process_one_shard(corpus_params, params):
+    corpus_type, fields, src_reader, tgt_reader, idx_reader, align_reader, opt,\
+         existing_fields, src_vocab, tgt_vocab = corpus_params
+    i, (src_shard, tgt_shard, idx_shard, \
+        align_shard, maybe_id, filter_pred) = params
+    # create one counter per shard
+    sub_sub_counter = defaultdict(Counter)
+    assert len(src_shard) == len(tgt_shard)
+    logger.info("Building shard %d." % i)
+
+    src_data = {"reader": src_reader, "data": src_shard, "dir": None}
+    tgt_data = {"reader": tgt_reader, "data": tgt_shard, "dir": None}
+    idx_data = {"reader": idx_reader, "data": idx_shard, "dir": None}
+    align_data = {"reader": align_reader, "data": align_shard, "dir": None}
+    _readers, _data, _dir = inputters.Dataset.config(
+        [('src', src_data), ('tgt', tgt_data), 
+         ('idx', idx_data), ('align', align_data)])
+
+    dataset = inputters.Dataset(
+        fields, readers=_readers, data=_data, dirs=_dir,
+        sort_key=inputters.str2sortkey[opt.data_type],
+        filter_pred=filter_pred,
+        corpus_id=maybe_id
+    )
+    if corpus_type == "train" and existing_fields is None:
+        for ex in dataset.examples:
+            sub_sub_counter['corpus_id'].update(
+                ["train" if maybe_id is None else maybe_id])
+            for name, field in fields.items():
+                try:
+                    f_iter = iter(field)
+                except TypeError:
+                    f_iter = [(name, field)]
+                    all_data = [getattr(ex, name, None)]
+                else:
+                    all_data = getattr(ex, name)
+                for (sub_n, sub_f), fd in zip(
+                        f_iter, all_data):
+                    has_vocab = (sub_n == 'src' and
+                                 src_vocab is not None) or \
+                                (sub_n == 'tgt' and
+                                 tgt_vocab is not None)
+                    if (hasattr(sub_f, 'sequential')
+                            and sub_f.sequential and not has_vocab
+                            and sub_n in ['src', 'tgt']):
+                        val = fd
+                        sub_sub_counter[sub_n].update(val)
+
+    if maybe_id:
+        shard_base = corpus_type + "_" + maybe_id
+    else:
+        shard_base = corpus_type
+    data_path = "{:s}.{:s}.{:d}.pt".\
+        format(opt.save_data, shard_base, i)
+
+    logger.info(" * saving %sth %s data shard to %s."
+                % (i, shard_base, data_path))
+    dataset.save(data_path)
+
+    del dataset.examples
+    gc.collect()
+    del dataset
+    gc.collect()
+
+    return sub_sub_counter
+
+
+def maybe_load_vocab(corpus_type, counters, opt):
+    src_vocab = None
+    tgt_vocab = None
+    existing_fields = None
+    if corpus_type == "train":
+        if opt.src_vocab != "":
+            try:
+                logger.info("Using existing vocabulary...")
+                existing_fields = torch.load(opt.src_vocab)
+            except torch.serialization.pickle.UnpicklingError:
+                logger.info("Building vocab from text file...")
+                src_vocab, src_vocab_size = _load_vocab(
+                    opt.src_vocab, "src", counters,
+                    opt.src_words_min_frequency)
+        if opt.tgt_vocab != "":
+            tgt_vocab, tgt_vocab_size = _load_vocab(
+                opt.tgt_vocab, "tgt", counters,
+                opt.tgt_words_min_frequency)
+    return src_vocab, tgt_vocab, existing_fields
+
+
+def build_save_dataset(corpus_type, fields, src_reader, tgt_reader, idx_reader,
+                       align_reader, opt):
+    assert corpus_type in ['train', 'valid']
+
+    if corpus_type == 'train':
+        counters = defaultdict(Counter)
+        srcs = opt.train_src
+        tgts = opt.train_tgt
+        idxs = opt.train_idx
+        ids = opt.train_ids
+        aligns = opt.train_align
+    elif corpus_type == 'valid':
+        counters = None
+        srcs = [opt.valid_src]
+        tgts = [opt.valid_tgt]
+        idxs = [opt.valid_idx]
+        ids = [None]
+        aligns = [opt.valid_align]
+
+    src_vocab, tgt_vocab, existing_fields = maybe_load_vocab(
+        corpus_type, counters, opt)
+
+    existing_shards = check_existing_pt_files(
+        opt, corpus_type, ids, existing_fields)
+
+    # every corpus has shards, no new one
+    if existing_shards == ids and not opt.overwrite:
+        return
+
+    def shard_iterator(srcs, tgts, idxs, ids, aligns, existing_shards,
+                       existing_fields, corpus_type, opt):
+        """
+        Builds a single iterator yielding every shard of every corpus.
+        """
+        for src, tgt, idx, maybe_id, maybe_align in \
+                zip(srcs, tgts, idxs, ids, aligns):
+            if maybe_id in existing_shards:
+                if opt.overwrite:
+                    logger.warning("Overwrite shards for corpus {}"
+                                   .format(maybe_id))
+                else:
+                    if corpus_type == "train":
+                        assert existing_fields is not None,\
+                            ("A 'vocab.pt' file should be passed to "
+                             "`-src_vocab` when adding a corpus to "
+                             "a set of already existing shards.")
+                    logger.warning("Ignore corpus {} because "
+                                   "shards already exist"
+                                   .format(maybe_id))
+                    continue
+            if ((corpus_type == "train" or opt.filter_valid)
+                    and tgt is not None):
+                filter_pred = partial(
+                    inputters.filter_example,
+                    use_src_len=opt.data_type == "text",
+                    max_src_len=opt.src_seq_length,
+                    max_tgt_len=opt.tgt_seq_length)
+            else:
+                filter_pred = None
+            src_shards = split_corpus(src, opt.shard_size)
+            tgt_shards = split_corpus(tgt, opt.shard_size)
+            idx_shards = split_corpus(idx, opt.shard_size)
+            align_shards = split_corpus(maybe_align, opt.shard_size)
+            for i, (ss, ts, i_s, a_s) in enumerate(
+                    zip(src_shards, tgt_shards, idx_shards, align_shards)):
+                yield (i, (ss, ts, i_s, a_s, maybe_id, filter_pred))
+
+    shard_iter = shard_iterator(srcs, tgts, idxs, ids, aligns, existing_shards,
+                                existing_fields, corpus_type, opt)
+
+    with Pool(opt.num_threads) as p:
+        dataset_params = (corpus_type, fields, src_reader, tgt_reader,
+                          idx_reader, align_reader, opt, existing_fields,
+                          src_vocab, tgt_vocab)
+        func = partial(process_one_shard, dataset_params)
+        for sub_counter in p.imap(func, shard_iter):
+            if sub_counter is not None:
+                for key, value in sub_counter.items():
+                    counters[key].update(value)
+
+    if corpus_type == "train":
+        vocab_path = opt.save_data + '.vocab.pt'
+        new_fields = _build_fields_vocab(
+            fields, counters, opt.data_type,
+            opt.share_vocab, opt.vocab_size_multiple,
+            opt.src_vocab_size, opt.src_words_min_frequency,
+            opt.tgt_vocab_size, opt.tgt_words_min_frequency,
+            subword_prefix=opt.subword_prefix,
+            subword_prefix_is_joiner=opt.subword_prefix_is_joiner)
+        if existing_fields is None:
+            fields = new_fields
+        else:
+            fields = existing_fields
+
+        if old_style_vocab(fields):
+            fields = load_old_vocab(
+                fields, opt.data_type, dynamic_dict=opt.dynamic_dict)
+
+        # patch corpus_id
+        if fields.get("corpus_id", False):
+            fields["corpus_id"].vocab = new_fields["corpus_id"].vocab_cls(
+                counters["corpus_id"])
+
+        torch.save(fields, vocab_path)
+
+
+def build_save_vocab(train_dataset, fields, opt):
+    fields = inputters.build_vocab(
+        train_dataset, fields, opt.data_type, opt.share_vocab,
+        opt.src_vocab, opt.src_vocab_size, opt.src_words_min_frequency,
+        opt.tgt_vocab, opt.tgt_vocab_size, opt.tgt_words_min_frequency,
+        vocab_size_multiple=opt.vocab_size_multiple
+    )
+    vocab_path = opt.save_data + '.vocab.pt'
+    torch.save(fields, vocab_path)
+
+
+def count_features(path):
+    """
+    path: location of a corpus file with whitespace-delimited tokens and
+                    ￨-delimited features within the token
+    returns: the number of features in the dataset
+    """
+    with codecs.open(path, "r", "utf-8") as f:
+        first_tok = f.readline().split(None, 1)[0]
+        return len(first_tok.split(u"￨")) - 1
+
+
+def preprocess(opt):
+    ArgumentParser.validate_preprocess_args(opt)
+    torch.manual_seed(opt.seed)
+
+    init_logger(opt.log_file)
+
+    logger.info("Extracting features...")
+
+    src_nfeats = 0
+    tgt_nfeats = 0
+    for src, tgt in zip(opt.train_src, opt.train_tgt):
+        src_nfeats += count_features(src) if opt.data_type == 'text' \
+            else 0
+        tgt_nfeats += count_features(tgt)  # tgt always text so far
+    logger.info(" * number of source features: %d." % src_nfeats)
+    logger.info(" * number of target features: %d." % tgt_nfeats)
+
+    logger.info("Building `Fields` object...")
+    fields = inputters.get_fields(
+        opt.data_type,
+        src_nfeats,
+        tgt_nfeats,
+        dynamic_dict=opt.dynamic_dict,
+        with_align=opt.train_align[0] is not None,
+        src_truncate=opt.src_seq_length_trunc,
+        tgt_truncate=opt.tgt_seq_length_trunc)
+
+    src_reader = inputters.str2reader["text"].from_opt(opt)
+    tgt_reader = inputters.str2reader["text"].from_opt(opt)
+    idx_reader = inputters.str2reader["vec"].from_opt(opt)
+    align_reader = inputters.str2reader["text"].from_opt(opt)
+
+    logger.info("Building & saving training data...")
+    build_save_dataset(
+        'train', fields, src_reader, tgt_reader, idx_reader, align_reader, opt)
+
+    if opt.valid_src and opt.valid_tgt:
+        logger.info("Building & saving validation data...")
+        build_save_dataset(
+            'valid', fields, src_reader, tgt_reader, idx_reader, align_reader, opt)
+
+
+def _get_parser():
+    parser = ArgumentParser(description='preprocess.py')
+
+    opts.config_opts(parser)
+    opts.preprocess_opts(parser)
+    return parser
+
+
+def main():
+    parser = _get_parser()
+
+    opt = parser.parse_args()
+    preprocess(opt)
+
+
+if __name__ == "__main__":
+    main()
+
+#==================================================================
+# train.py
+        b.idx = tuple([_.to(torch.device(device_id))
+                        for _ in b.idx])
+#==================================================================
+# transformer.py
+"""
+Implementation of "Attention is All You Need"
+"""
+
+import torch
+import torch.nn as nn
+
+from onmt.decoders.decoder import DecoderBase
+from onmt.modules import MultiHeadedAttention, AverageAttention
+from onmt.modules.position_ffn import PositionwiseFeedForward
+from onmt.utils.misc import sequence_mask
+
+
+def get_seen_mask(pointer, SL):
+    """
+    pointer: (B, TL)
+    return (B, TL, SL)
+    """
+    mask = torch.ones((pointer.size(0), pointer.size(1), SL), 
+                        dtype=pointer.dtype, device=pointer.device)
+    for b in range(pointer.size(0)):
+        for t in range(pointer.size(1)):
+            idx = pointer[b, t] - 1 # [0, ..., SL-1] ==> [0, ..., SL-2]
+            if idx > -1:
+                mask[b, t+1:, idx] = 0
+    return mask
+
+
+class TransformerDecoderLayer(nn.Module):
+    """Transformer Decoder layer block in Pre-Norm style.
+    Pre-Norm style is an improvement w.r.t. Original paper's Post-Norm style,
+    providing better converge speed and performance. This is also the actual
+    implementation in tensor2tensor and also avalable in fairseq.
+    See https://tunz.kr/post/4 and :cite:`DeeperTransformer`.
+
+    .. mermaid::
+
+        graph LR
+        %% "*SubLayer" can be self-attn, src-attn or feed forward block
+            A(input) --> B[Norm]
+            B --> C["*SubLayer"]
+            C --> D[Drop]
+            D --> E((+))
+            A --> E
+            E --> F(out)
+
+
+    Args:
+        d_model (int): the dimension of keys/values/queries in
+            :class:`MultiHeadedAttention`, also the input size of
+            the first-layer of the :class:`PositionwiseFeedForward`.
+        heads (int): the number of heads for MultiHeadedAttention.
+        d_ff (int): the second-layer of the :class:`PositionwiseFeedForward`.
+        dropout (float): dropout in residual, self-attn(dot) and feed-forward
+        attention_dropout (float): dropout in context_attn (and self-attn(avg))
+        self_attn_type (string): type of self-attention scaled-dot, average
+        max_relative_positions (int):
+            Max distance between inputs in relative positions representations
+        aan_useffn (bool): Turn on the FFN layer in the AAN decoder
+        full_context_alignment (bool):
+            whether enable an extra full context decoder forward for alignment
+        alignment_heads (int):
+            N. of cross attention heads to use for alignment guiding
+    """
+
+    def __init__(self, d_model, heads, d_ff, dropout, attention_dropout,
+                 self_attn_type="scaled-dot", max_relative_positions=0,
+                 aan_useffn=False, full_context_alignment=False,
+                 alignment_heads=0):
+        super(TransformerDecoderLayer, self).__init__()
+
+        if self_attn_type == "scaled-dot":
+            self.self_attn = MultiHeadedAttention(
+                heads, d_model, dropout=attention_dropout,
+                max_relative_positions=max_relative_positions)
+        elif self_attn_type == "average":
+            self.self_attn = AverageAttention(d_model,
+                                              dropout=attention_dropout,
+                                              aan_useffn=aan_useffn)
+
+        self.context_attn = MultiHeadedAttention(
+            heads, d_model, dropout=attention_dropout)
+        self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
+        self.layer_norm_1 = nn.LayerNorm(d_model, eps=1e-6)
+        self.layer_norm_2 = nn.LayerNorm(d_model, eps=1e-6)
+        self.drop = nn.Dropout(dropout)
+        self.full_context_alignment = full_context_alignment
+        self.alignment_heads = alignment_heads
+
+    def forward(self, *args, **kwargs):
+        """ Extend `_forward` for (possibly) multiple decoder pass:
+        Always a default (future masked) decoder forward pass,
+        Possibly a second future aware decoder pass for joint learn
+        full context alignement, :cite:`garg2019jointly`.
+
+        Args:
+            * All arguments of _forward.
+            with_align (bool): whether return alignment attention.
+
+        Returns:
+            (FloatTensor, FloatTensor, FloatTensor or None):
+
+            * output ``(batch_size, T, model_dim)``
+            * top_attn ``(batch_size, T, src_len)``
+            * attn_align ``(batch_size, T, src_len)`` or None
+        """
+        with_align = kwargs.pop('with_align', False)
+        output, attns = self._forward(*args, **kwargs)
+        top_attn = attns[:, 0, :, :].contiguous()
+        avg_attn = attns.mean(dim=1).contiguous()
+        attn_align = None
+        if with_align:
+            if self.full_context_alignment:
+                # return _, (B, Q_len, K_len)
+                _, attns = self._forward(*args, **kwargs, future=True)
+
+            if self.alignment_heads > 0:
+                attns = attns[:, :self.alignment_heads, :, :].contiguous()
+            # layer average attention across heads, get ``(B, Q, K)``
+            # Case 1: no full_context, no align heads -> layer avg baseline
+            # Case 2: no full_context, 1 align heads -> guided align
+            # Case 3: full_context, 1 align heads -> full cte guided align
+            attn_align = attns.mean(dim=1)
+        return output, top_attn, avg_attn, attn_align
+
+    def _forward(self, inputs, memory_bank, src_pad_mask, tgt_pad_mask,
+                 layer_cache=None, step=None, future=False):
+        """ A naive forward pass for transformer decoder.
+
+        # T: could be 1 in the case of stepwise decoding or tgt_len
+
+        Args:
+            inputs (FloatTensor): ``(batch_size, T, model_dim)``
+            memory_bank (FloatTensor): ``(batch_size, src_len, model_dim)``
+            src_pad_mask (LongTensor): ``(batch_size, 1, src_len)``
+            tgt_pad_mask (LongTensor): ``(batch_size, 1, T)``
+            layer_cache (dict or None): cached layer info when stepwise decode
+            step (int or None): stepwise decoding counter
+            future (bool): If set True, do not apply future_mask.
+
+        Returns:
+            (FloatTensor, FloatTensor):
+
+            * output ``(batch_size, T, model_dim)``
+            * attns ``(batch_size, head, T, src_len)``
+
+        """
+        dec_mask = None
+
+        if step is None:
+            tgt_len = tgt_pad_mask.size(-1)
+            if not future:  # apply future_mask, result mask in (B, T, T)
+                future_mask = torch.ones(
+                    [tgt_len, tgt_len],
+                    device=tgt_pad_mask.device,
+                    dtype=torch.uint8)
+                future_mask = future_mask.triu_(1).view(1, tgt_len, tgt_len)
+                # BoolTensor was introduced in pytorch 1.2
+                try:
+                    future_mask = future_mask.bool()
+                except AttributeError:
+                    pass
+                dec_mask = torch.gt(tgt_pad_mask + future_mask, 0)
+            else:  # only mask padding, result mask in (B, 1, T)
+                dec_mask = tgt_pad_mask
+
+        input_norm = self.layer_norm_1(inputs)
+
+        if isinstance(self.self_attn, MultiHeadedAttention):
+            query, _ = self.self_attn(input_norm, input_norm, input_norm,
+                                      mask=dec_mask,
+                                      layer_cache=layer_cache,
+                                      attn_type="self")
+        elif isinstance(self.self_attn, AverageAttention):
+            query, _ = self.self_attn(input_norm, mask=dec_mask,
+                                      layer_cache=layer_cache, step=step)
+
+        query = self.drop(query) + inputs
+
+        query_norm = self.layer_norm_2(query)
+        mid, attns = self.context_attn(memory_bank, memory_bank, query_norm,
+                                       mask=src_pad_mask,
+                                       layer_cache=layer_cache,
+                                       attn_type="context")
+        output = self.feed_forward(self.drop(mid) + query)
+
+        return output, attns
+
+    def update_dropout(self, dropout, attention_dropout):
+        self.self_attn.update_dropout(attention_dropout)
+        self.context_attn.update_dropout(attention_dropout)
+        self.feed_forward.update_dropout(dropout)
+        self.drop.p = dropout
+
+
+class TransformerCopierLayer(nn.Module):
+    """Transformer Decoder layer block in Pre-Norm style.
+    Pre-Norm style is an improvement w.r.t. Original paper's Post-Norm style,
+    providing better converge speed and performance. This is also the actual
+    implementation in tensor2tensor and also avalable in fairseq.
+    See https://tunz.kr/post/4 and :cite:`DeeperTransformer`.
+
+    .. mermaid::
+
+        graph LR
+        %% "*SubLayer" can be self-attn, src-attn or feed forward block
+            A(input) --> B[Norm]
+            B --> C["*SubLayer"]
+            C --> D[Drop]
+            D --> E((+))
+            A --> E
+            E --> F(out)
+
+
+    Args:
+        d_model (int): the dimension of keys/values/queries in
+            :class:`MultiHeadedAttention`, also the input size of
+            the first-layer of the :class:`PositionwiseFeedForward`.
+        heads (int): the number of heads for MultiHeadedAttention.
+        dropout (float): dropout in residual, self-attn(dot) and feed-forward
+        attention_dropout (float): dropout in context_attn (and self-attn(avg))
+        self_attn_type (string): type of self-attention scaled-dot, average
+        max_relative_positions (int):
+            Max distance between inputs in relative positions representations
+    """
+
+    def __init__(self, d_model, heads, dropout, attention_dropout,
+                 self_attn_type="scaled-dot", max_relative_positions=0):
+        super(TransformerCopierLayer, self).__init__()
+
+        self.self_attn = MultiHeadedAttention(
+            heads, d_model, dropout=attention_dropout,
+            max_relative_positions=max_relative_positions)
+        self.context_attn = MultiHeadedAttention(
+            heads, d_model, dropout=attention_dropout)
+        self.layer_norm_1 = nn.LayerNorm(d_model, eps=1e-6)
+        self.layer_norm_2 = nn.LayerNorm(d_model, eps=1e-6)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, inputs, pointers, memory_bank, src_pad_mask, tgt_pad_mask,
+                layer_cache=None, step=None, future=False):
+        """ A naive forward pass for transformer decoder.
+
+        # T: could be 1 in the case of stepwise decoding or tgt_len
+
+        Args:
+            inputs (FloatTensor): ``(batch_size, T, model_dim)``
+            memory_bank (FloatTensor): ``(batch_size, src_len, model_dim)``
+            src_pad_mask (LongTensor): ``(batch_size, 1, src_len)``
+            tgt_pad_mask (LongTensor): ``(batch_size, 1, T)``
+            layer_cache (dict or None): cached layer info when stepwise decode
+            step (int or None): stepwise decoding counter
+            future (bool): If set True, do not apply future_mask.
+
+        Returns:
+            (FloatTensor, FloatTensor):
+
+            * output ``(batch_size, T, model_dim)``
+            * attns ``(batch_size, head, T, src_len)``
+
+        """
+        dec_mask = None
+
+        if step is None:
+            tgt_len = tgt_pad_mask.size(-1)
+            if not future:  # apply future_mask, result mask in (B, T, T)
+                future_mask = torch.ones(
+                    [tgt_len, tgt_len],
+                    device=tgt_pad_mask.device,
+                    dtype=torch.uint8)
+                future_mask = future_mask.triu_(1).view(1, tgt_len, tgt_len)
+                # BoolTensor was introduced in pytorch 1.2
+                try:
+                    future_mask = future_mask.bool()
+                except AttributeError:
+                    pass
+                dec_mask = torch.gt(tgt_pad_mask + future_mask, 0)
+            else:  # only mask padding, result mask in (B, 1, T)
+                dec_mask = tgt_pad_mask
+
+        input_norm = self.layer_norm_1(inputs)
+        query, _ = self.self_attn(input_norm, input_norm, input_norm,
+                                  mask=dec_mask,
+                                  layer_cache=layer_cache,
+                                  attn_type="self")
+        query = self.drop(query) + inputs
+
+        query_norm = self.layer_norm_2(query)
+        
+        # src_pad_mask: (batch_size, Q=1, K,V=src_len-2)
+        # seen_mask   : (batch_size, Q=tgt_len, K,V=src_len-2)
+        # pointers    : (batch_size, Q=tgt_len)
+
+        # src (B, TL, SL)
+        # index (B, TL, SL)
+        # mask (B, TL, SL)
+        # print(pointers.shape, src_pad_mask.shape)
+        if pointers.size(1) > 1: # TL > 1 (when training)
+            mask = torch.zeros( # [B, TL-1, SL+1]
+                (pointers.size(0), pointers.size(1) -1, 
+                 src_pad_mask.size(-1) +1), 
+                dtype=pointers.dtype, device=pointers.device)
+            indx = pointers[:, :-1].unsqueeze(-1) # [B, TL-1, 1]
+            pointer_onehot = mask.scatter_(-1, indx, 1) # [B, TL-1, SL+1]
+            pointer_onehot = pointer_onehot[:, :, 1:] # [B, TL-1, SL]
+            pointer_onehot_shifted = torch.cat( # [B, TL, SL]
+                [pointer_onehot[:, :1, :], pointer_onehot], axis=1)
+            seen_mask = pointer_onehot_shifted.cumsum(dim=1).bool()
+        else: # TL == 1 (when testing or B==1)
+            mask = torch.zeros( # [B, 1, SL+1]
+                (pointers.size(0), 1, src_pad_mask.size(-1) +1), 
+                dtype=pointers.dtype, device=pointers.device)
+            indx = pointers # [B, 1, 1]
+
+
+            seen_mask = torch.zeros(
+                (pointers.size(0), 1, src_pad_mask.size(-1)), 
+                dtype=pointers.dtype, device=pointers.device).bool()
+
+        # seen_mask_ref = get_seen_mask(pointers, src_pad_mask.size(-1)).bool()
+        # assert (~seen_mask_ref == seen_mask).all()
+
+        pad_or_seen_mask = torch.logical_or(src_pad_mask, seen_mask)
+
+        # print(pointers[-1])
+        # # print(1 - seen_mask_ref.int())
+        # print(seen_mask.int()[-1])
+        # print(src_pad_mask.int()[-1])
+        # print(pad_or_seen_mask.int()[-1])
+        # print('===')
+        # # assert
+
+        _, attns = self.context_attn(memory_bank, memory_bank, query_norm,
+                                     mask=pad_or_seen_mask,
+                                     layer_cache=layer_cache,
+                                     attn_type="context")
+        return attns.mean(dim=1).contiguous()
+
+    def update_dropout(self, dropout, attention_dropout):
+        self.self_attn.update_dropout(attention_dropout)
+        self.context_attn.update_dropout(attention_dropout)
+        self.drop.p = dropout
+
+
+class TransformerDecoder(DecoderBase):
+    """The Transformer decoder from "Attention is All You Need".
+    :cite:`DBLP:journals/corr/VaswaniSPUJGKP17`
+
+    .. mermaid::
+
+       graph BT
+          A[input]
+          B[multi-head self-attn]
+          BB[multi-head src-attn]
+          C[feed forward]
+          O[output]
+          A --> B
+          B --> BB
+          BB --> C
+          C --> O
+
+
+    Args:
+        num_layers (int): number of encoder layers.
+        d_model (int): size of the model
+        heads (int): number of heads
+        d_ff (int): size of the inner FF layer
+        copy_attn (bool): if using a separate copy attention
+        self_attn_type (str): type of self-attention scaled-dot, average
+        dropout (float): dropout in residual, self-attn(dot) and feed-forward
+        attention_dropout (float): dropout in context_attn (and self-attn(avg))
+        embeddings (onmt.modules.Embeddings):
+            embeddings to use, should have positional encodings
+        max_relative_positions (int):
+            Max distance between inputs in relative positions representations
+        aan_useffn (bool): Turn on the FFN layer in the AAN decoder
+        full_context_alignment (bool):
+            whether enable an extra full context decoder forward for alignment
+        alignment_layer (int): N° Layer to supervise with for alignment guiding
+        alignment_heads (int):
+            N. of cross attention heads to use for alignment guiding
+    """
+
+    def __init__(self, num_layers, d_model, heads, d_ff,
+                 copy_attn, self_attn_type, dropout, attention_dropout,
+                 embeddings, max_relative_positions, aan_useffn,
+                 full_context_alignment, alignment_layer,
+                 alignment_heads):
+        super(TransformerDecoder, self).__init__()
+
+        self.embeddings = embeddings
+
+        # Decoder State
+        self.state = {}
+
+        self.transformer_layers = nn.ModuleList(
+            [TransformerDecoderLayer(d_model, heads, d_ff, dropout,
+             attention_dropout, self_attn_type=self_attn_type,
+             max_relative_positions=max_relative_positions,
+             aan_useffn=aan_useffn,
+             full_context_alignment=full_context_alignment,
+             alignment_heads=alignment_heads)
+             for i in range(num_layers)])
+
+        # previously, there was a GlobalAttention module here for copy
+        # attention. But it was never actually used -- the "copy" attention
+        # just reuses the context attention.
+        self._copy = copy_attn
+        self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
+
+        self.alignment_layer = alignment_layer
+
+        self.copier = TransformerCopierLayer(d_model, heads, dropout,
+             attention_dropout, self_attn_type=self_attn_type,
+             max_relative_positions=max_relative_positions)
+
+    @classmethod
+    def from_opt(cls, opt, embeddings):
+        """Alternate constructor."""
+        return cls(
+            opt.dec_layers,
+            opt.dec_rnn_size,
+            opt.heads,
+            opt.transformer_ff,
+            opt.copy_attn,
+            opt.self_attn_type,
+            opt.dropout[0] if type(opt.dropout) is list else opt.dropout,
+            opt.attention_dropout[0] if type(opt.attention_dropout)
+            is list else opt.dropout,
+            embeddings,
+            opt.max_relative_positions,
+            opt.aan_useffn,
+            opt.full_context_alignment,
+            opt.alignment_layer,
+            alignment_heads=opt.alignment_heads)
+
+    def init_state(self, src, memory_bank, enc_hidden):
+        """Initialize decoder state."""
+        self.state["src"] = src
+        self.state["cache"] = None
+
+    def map_state(self, fn):
+        def _recursive_map(struct, batch_dim=0):
+            for k, v in struct.items():
+                if v is not None:
+                    if isinstance(v, dict):
+                        _recursive_map(v)
+                    else:
+                        struct[k] = fn(v, batch_dim)
+
+        self.state["src"] = fn(self.state["src"], 1)
+        if self.state["cache"] is not None:
+            _recursive_map(self.state["cache"])
+
+    def detach_state(self):
+        self.state["src"] = self.state["src"].detach()
+
+    def forward(self, tgt, idx, memory_bank, step=None, **kwargs):
+        """Decode, possibly stepwise."""
+        if step == 0:
+            self._init_cache(memory_bank)
+
+        tgt_words = tgt[:, :, 0].transpose(0, 1)
+        pointers = idx[:, :, 0].transpose(0, 1)
+
+        emb = self.embeddings(tgt, step=step)
+        assert emb.dim() == 3  # len x batch x embedding_dim
+
+        output = emb.transpose(0, 1).contiguous()
+        src_memory_bank = memory_bank.transpose(0, 1).contiguous()
+
+        pad_idx = self.embeddings.word_padding_idx
+        src_lens = kwargs["memory_lengths"]
+        src_max_len = self.state["src"].shape[0]
+        src_pad_mask = ~sequence_mask(src_lens, src_max_len).unsqueeze(1)
+        tgt_pad_mask = tgt_words.data.eq(pad_idx).unsqueeze(1)  # [B, 1, T_tgt]
+
+        with_align = kwargs.pop('with_align', False)
+        attn_aligns = []
+
+        for i, layer in enumerate(self.transformer_layers):
+            layer_cache = self.state["cache"]["layer_{}".format(i)] \
+                if step is not None else None
+            output, attn_top, attn_avg, attn_align = layer(
+                output,
+                src_memory_bank,
+                src_pad_mask,
+                tgt_pad_mask,
+                layer_cache=layer_cache,
+                step=step,
+                with_align=with_align)
+            if attn_align is not None:
+                attn_aligns.append(attn_align)
+
+        output = self.layer_norm(output)
+        dec_outs = output.transpose(0, 1).contiguous()
+        # (tgt_len, batch_size, src_len)
+        attn_top = attn_top.transpose(0, 1).contiguous()
+        # (tgt_len, batch_size, src_len)
+        attn_avg = attn_avg.transpose(0, 1).contiguous()
+
+        attns = {"std": attn_top, "avg": attn_avg}
+
+        # run copier
+        layer_cache = self.state["cache"]["layer_cop"] \
+            if step is not None else None
+        attn_cop = self.copier(
+            output,
+            pointers,
+            src_memory_bank[:, 1:-1],
+            src_pad_mask[:, :, 1:-1],
+            tgt_pad_mask,
+            layer_cache=layer_cache,
+            step=step)
+        attn_cop = attn_cop.transpose(0, 1).contiguous()
+        attns["cop"] = attn_cop
+
+        if self._copy:
+            attns["copy"] = attn
+        if with_align:
+            attns["align"] = attn_aligns[self.alignment_layer]  # `(B, Q, K)`
+            # attns["align"] = torch.stack(attn_aligns, 0).mean(0)  # All avg
+
+        # TODO change the way attns is returned dict => list or tuple (onnx)
+        return emb, dec_outs, attns
+
+    def _init_cache(self, memory_bank):
+        self.state["cache"] = {}
+        batch_size = memory_bank.size(1)
+        depth = memory_bank.size(-1)
+
+        for i, layer in enumerate(self.transformer_layers):
+            layer_cache = {"memory_keys": None, "memory_values": None}
+            if isinstance(layer.self_attn, AverageAttention):
+                layer_cache["prev_g"] = torch.zeros((batch_size, 1, depth),
+                                                    device=memory_bank.device)
+            else:
+                layer_cache["self_keys"] = None
+                layer_cache["self_values"] = None
+            self.state["cache"]["layer_{}".format(i)] = layer_cache
+
+        # for copy layer
+        layer_cache = {"memory_keys": None, "memory_values": None, 
+                       "self_keys": None, "self_values": None}
+        self.state["cache"]["layer_cop"] = layer_cache
+
+    def update_dropout(self, dropout, attention_dropout):
+        self.embeddings.update_dropout(dropout)
+        for layer in self.transformer_layers:
+            layer.update_dropout(dropout, attention_dropout)
+        self.copier.update_dropout(dropout, attention_dropout)
+
+#==================================================================
+# inputter.py
+# -*- coding: utf-8 -*-
+import glob
+import os
+import codecs
+import math
+
+from collections import Counter, defaultdict
+from itertools import chain, cycle
+
+import torch
+import torchtext.data
+from torchtext.data import Field, RawField, LabelField
+from torchtext.vocab import Vocab
+from torchtext.data.utils import RandomShuffler
+
+from onmt.inputters.text_dataset import text_fields, TextMultiField
+# from onmt.inputters.image_dataset import image_fields
+# from onmt.inputters.audio_dataset import audio_fields
+from onmt.inputters.vec_dataset import vec_fields
+from onmt.utils.logging import logger
+# backwards compatibility
+from onmt.inputters.text_dataset import _feature_tokenize  # noqa: F401
+# from onmt.inputters.image_dataset import (  # noqa: F401
+#     batch_img as make_img)
+
+import gc
+
+
+# monkey-patch to make torchtext Vocab's pickleable
+def _getstate(self):
+    return dict(self.__dict__, stoi=dict(self.stoi))
+
+
+def _setstate(self, state):
+    self.__dict__.update(state)
+    self.stoi = defaultdict(lambda: 0, self.stoi)
+
+
+Vocab.__getstate__ = _getstate
+Vocab.__setstate__ = _setstate
+
+
+def make_src(data, vocab):
+    src_size = max([t.size(0) for t in data])
+    src_vocab_size = max([t.max() for t in data]) + 1
+    alignment = torch.zeros(src_size, len(data), src_vocab_size)
+    for i, sent in enumerate(data):
+        for j, t in enumerate(sent):
+            alignment[j, i, t] = 1
+    return alignment
+
+
+def make_tgt(data, vocab):
+    tgt_size = max([t.size(0) for t in data])
+    alignment = torch.zeros(tgt_size, len(data)).long()
+    for i, sent in enumerate(data):
+        alignment[:sent.size(0), i] = sent
+    return alignment
+
+
+class AlignField(LabelField):
+    """
+    Parse ['<src>-<tgt>', ...] into ['<src>','<tgt>', ...]
+    """
+
+    def __init__(self, **kwargs):
+        kwargs['use_vocab'] = False
+        kwargs['preprocessing'] = parse_align_idx
+        super(AlignField, self).__init__(**kwargs)
+
+    def process(self, batch, device=None):
+        """ Turn a batch of align-idx to a sparse align idx Tensor"""
+        sparse_idx = []
+        for i, example in enumerate(batch):
+            for src, tgt in example:
+                # +1 for tgt side to keep coherent after "bos" padding,
+                # register ['N°_in_batch', 'tgt_id+1', 'src_id']
+                sparse_idx.append([i, tgt + 1, src])
+
+        align_idx = torch.tensor(sparse_idx, dtype=self.dtype, device=device)
+
+        return align_idx
+
+
+def parse_align_idx(align_pharaoh):
+    """
+    Parse Pharaoh alignment into [[<src>, <tgt>], ...]
+    """
+    align_list = align_pharaoh.strip().split(' ')
+    flatten_align_idx = []
+    for align in align_list:
+        try:
+            src_idx, tgt_idx = align.split('-')
+        except ValueError:
+            logger.warning("{} in `{}`".format(align, align_pharaoh))
+            logger.warning("Bad alignement line exists. Please check file!")
+            raise
+        flatten_align_idx.append([int(src_idx), int(tgt_idx)])
+    return flatten_align_idx
+
+
+def get_fields(
+    src_data_type,
+    n_src_feats,
+    n_tgt_feats,
+    pad='<blank>',
+    bos='<s>',
+    eos='</s>',
+    dynamic_dict=False,
+    with_align=False,
+    src_truncate=None,
+    tgt_truncate=None
+):
+    """
+    Args:
+        src_data_type: type of the source input. Options are [text|img|audio].
+        n_src_feats (int): the number of source features (not counting tokens)
+            to create a :class:`torchtext.data.Field` for. (If
+            ``src_data_type=="text"``, these fields are stored together
+            as a ``TextMultiField``).
+        n_tgt_feats (int): See above.
+        pad (str): Special pad symbol. Used on src and tgt side.
+        bos (str): Special beginning of sequence symbol. Only relevant
+            for tgt.
+        eos (str): Special end of sequence symbol. Only relevant
+            for tgt.
+        dynamic_dict (bool): Whether or not to include source map and
+            alignment fields.
+        with_align (bool): Whether or not to include word align.
+        src_truncate: Cut off src sequences beyond this (passed to
+            ``src_data_type``'s data reader - see there for more details).
+        tgt_truncate: Cut off tgt sequences beyond this (passed to
+            :class:`TextDataReader` - see there for more details).
+
+    Returns:
+        A dict mapping names to fields. These names need to match
+        the dataset example attributes.
+    """
+
+    assert src_data_type in ['text', 'img', 'audio', 'vec'], \
+        "Data type not implemented"
+    assert not dynamic_dict or src_data_type == 'text', \
+        'it is not possible to use dynamic_dict with non-text input'
+    fields = {}
+
+    fields_getters = {"text": text_fields,
+                    #   "img": image_fields,
+                    #   "audio": audio_fields,
+                      "vec": vec_fields}
+
+    src_field_kwargs = {"n_feats": n_src_feats,
+                        "include_lengths": True,
+                        "pad": pad, "bos": bos, "eos": eos,
+                        "truncate": src_truncate,
+                        "base_name": "src",
+                        "use_vocab": True}
+    fields["src"] = fields_getters["text"](**src_field_kwargs)
+
+    tgt_field_kwargs = {"n_feats": n_tgt_feats,
+                        "include_lengths": True,
+                        "pad": pad, "bos": bos, "eos": eos,
+                        "truncate": tgt_truncate,
+                        "base_name": "tgt",
+                        "use_vocab": True}
+    fields["tgt"] = fields_getters["text"](**tgt_field_kwargs)
+
+    idx_field_kwargs = {"n_feats": n_tgt_feats,
+                        "include_lengths": False,
+                        "pad": pad, "bos": pad, "eos": pad,
+                        "truncate": tgt_truncate,
+                        "base_name": "idx"}
+    fields["idx"] = fields_getters["vec"](**idx_field_kwargs)
+
+    indices = Field(use_vocab=False, dtype=torch.long, sequential=False)
+    fields["indices"] = indices
+
+    corpus_ids = Field(use_vocab=True, sequential=False)
+    fields["corpus_id"] = corpus_ids
+
+    if dynamic_dict:
+        src_map = Field(
+            use_vocab=False, dtype=torch.float,
+            postprocessing=make_src, sequential=False)
+        fields["src_map"] = src_map
+
+        src_ex_vocab = RawField()
+        fields["src_ex_vocab"] = src_ex_vocab
+
+        align = Field(
+            use_vocab=False, dtype=torch.long,
+            postprocessing=make_tgt, sequential=False)
+        fields["alignment"] = align
+
+    if with_align:
+        word_align = AlignField()
+        fields["align"] = word_align
+
+    return fields
+
+
+def patch_fields(opt, fields):
+    dvocab = torch.load(opt.data + '.vocab.pt')
+    maybe_cid_field = dvocab.get('corpus_id', None)
+    if maybe_cid_field is not None:
+        fields.update({'corpus_id': maybe_cid_field})
+
+
+def load_old_vocab(vocab, data_type="text", dynamic_dict=False):
+    """Update a legacy vocab/field format.
+
+    Args:
+        vocab: a list of (field name, torchtext.vocab.Vocab) pairs. This is the
+            format formerly saved in *.vocab.pt files. Or, text data
+            not using a :class:`TextMultiField`.
+        data_type (str): text, img, or audio
+        dynamic_dict (bool): Used for copy attention.
+
+    Returns:
+        a dictionary whose keys are the field names and whose values Fields.
+    """
+
+    if _old_style_vocab(vocab):
+        # List[Tuple[str, Vocab]] -> List[Tuple[str, Field]]
+        # -> dict[str, Field]
+        vocab = dict(vocab)
+        n_src_features = sum('src_feat_' in k for k in vocab)
+        n_tgt_features = sum('tgt_feat_' in k for k in vocab)
+        fields = get_fields(
+            data_type, n_src_features, n_tgt_features,
+            dynamic_dict=dynamic_dict)
+        for n, f in fields.items():
+            try:
+                f_iter = iter(f)
+            except TypeError:
+                f_iter = [(n, f)]
+            for sub_n, sub_f in f_iter:
+                if sub_n in vocab:
+                    sub_f.vocab = vocab[sub_n]
+        return fields
+
+    if _old_style_field_list(vocab):  # upgrade to multifield
+        # Dict[str, List[Tuple[str, Field]]]
+        # doesn't change structure - don't return early.
+        fields = vocab
+        for base_name, vals in fields.items():
+            if ((base_name == 'src' and data_type == 'text') or
+                    base_name == 'tgt'):
+                assert not isinstance(vals[0][1], TextMultiField)
+                fields[base_name] = [(base_name, TextMultiField(
+                    vals[0][0], vals[0][1], vals[1:]))]
+
+    if _old_style_nesting(vocab):
+        # Dict[str, List[Tuple[str, Field]]] -> List[Tuple[str, Field]]
+        # -> dict[str, Field]
+        fields = dict(list(chain.from_iterable(vocab.values())))
+
+    return fields
+
+
+def _old_style_vocab(vocab):
+    """Detect old-style vocabs (``List[Tuple[str, torchtext.data.Vocab]]``).
+
+    Args:
+        vocab: some object loaded from a *.vocab.pt file
+
+    Returns:
+        Whether ``vocab`` is a list of pairs where the second object
+        is a :class:`torchtext.vocab.Vocab` object.
+
+    This exists because previously only the vocab objects from the fields
+    were saved directly, not the fields themselves, and the fields needed to
+    be reconstructed at training and translation time.
+    """
+
+    return isinstance(vocab, list) and \
+        any(isinstance(v[1], Vocab) for v in vocab)
+
+
+def _old_style_nesting(vocab):
+    """Detect old-style nesting (``dict[str, List[Tuple[str, Field]]]``)."""
+    return isinstance(vocab, dict) and \
+        any(isinstance(v, list) for v in vocab.values())
+
+
+def _old_style_field_list(vocab):
+    """Detect old-style text fields.
+
+    Not old style vocab, old nesting, and text-type fields not using
+    ``TextMultiField``.
+
+    Args:
+        vocab: some object loaded from a *.vocab.pt file
+
+    Returns:
+        Whether ``vocab`` is not an :func:`_old_style_vocab` and not
+        a :class:`TextMultiField` (using an old-style text representation).
+    """
+
+    # if tgt isn't using TextMultiField, then no text field is.
+    return (not _old_style_vocab(vocab)) and _old_style_nesting(vocab) and \
+        (not isinstance(vocab['tgt'][0][1], TextMultiField))
+
+
+def old_style_vocab(vocab):
+    """The vocab/fields need updated."""
+    return _old_style_vocab(vocab) or _old_style_field_list(vocab) or \
+        _old_style_nesting(vocab)
+
+
+def filter_example(ex, use_src_len=True, use_tgt_len=True,
+                   min_src_len=1, max_src_len=float('inf'),
+                   min_tgt_len=1, max_tgt_len=float('inf')):
+    """Return whether an example is an acceptable length.
+
+    If used with a dataset as ``filter_pred``, use :func:`partial()`
+    for all keyword arguments.
+
+    Args:
+        ex (torchtext.data.Example): An object with a ``src`` and ``tgt``
+            property.
+        use_src_len (bool): Filter based on the length of ``ex.src``.
+        use_tgt_len (bool): Similar to above.
+        min_src_len (int): A non-negative minimally acceptable length
+            (examples of exactly this length will be included).
+        min_tgt_len (int): Similar to above.
+        max_src_len (int or float): A non-negative (possibly infinite)
+            maximally acceptable length (examples of exactly this length
+            will be included).
+        max_tgt_len (int or float): Similar to above.
+    """
+
+    src_len = len(ex.src[0])
+    tgt_len = len(ex.tgt[0])
+    return (not use_src_len or min_src_len <= src_len <= max_src_len) and \
+        (not use_tgt_len or min_tgt_len <= tgt_len <= max_tgt_len)
+
+
+def _pad_vocab_to_multiple(vocab, multiple):
+    vocab_size = len(vocab)
+    if vocab_size % multiple == 0:
+        return
+    target_size = int(math.ceil(vocab_size / multiple)) * multiple
+    padding_tokens = [
+        "averyunlikelytoken%d" % i for i in range(target_size - vocab_size)]
+    vocab.extend(Vocab(Counter(), specials=padding_tokens))
+    return vocab
+
+
+def _build_field_vocab(field, counter, size_multiple=1, **kwargs):
+    # this is basically copy-pasted from torchtext.
+    all_specials = [
+        field.unk_token, field.pad_token, field.init_token, field.eos_token
+    ]
+    specials = [tok for tok in all_specials if tok is not None]
+    field.vocab = field.vocab_cls(counter, specials=specials, **kwargs)
+    if size_multiple > 1:
+        _pad_vocab_to_multiple(field.vocab, size_multiple)
+
+
+def _load_vocab(vocab_path, name, counters, min_freq):
+    # counters changes in place
+    vocab = _read_vocab_file(vocab_path, name)
+    vocab_size = len(vocab)
+    logger.info('Loaded %s vocab has %d tokens.' % (name, vocab_size))
+    for i, token in enumerate(vocab):
+        # keep the order of tokens specified in the vocab file by
+        # adding them to the counter with decreasing counting values
+        counters[name][token] = vocab_size - i + min_freq
+    return vocab, vocab_size
+
+
+def _build_fv_from_multifield(multifield, counters, build_fv_args,
+                              size_multiple=1):
+    for name, field in multifield:
+        _build_field_vocab(
+            field,
+            counters[name],
+            size_multiple=size_multiple,
+            **build_fv_args[name])
+        if name in ['src', 'tgt']:
+            logger.info([field.vocab.itos[i] for i in range(len(field.vocab))])
+            logger.info(" * %s vocab size: %d." % (name, len(field.vocab)))
+
+
+def _build_fields_vocab(fields, counters, data_type, share_vocab,
+                        vocab_size_multiple,
+                        src_vocab_size, src_words_min_frequency,
+                        tgt_vocab_size, tgt_words_min_frequency,
+                        subword_prefix="▁",
+                        subword_prefix_is_joiner=False):
+    build_fv_args = defaultdict(dict)
+    build_fv_args["src"] = dict(
+        max_size=src_vocab_size, min_freq=src_words_min_frequency)
+    build_fv_args["tgt"] = dict(
+        max_size=tgt_vocab_size, min_freq=tgt_words_min_frequency)
+    tgt_multifield = fields["tgt"]
+    _build_fv_from_multifield(
+        tgt_multifield,
+        counters,
+        build_fv_args,
+        size_multiple=vocab_size_multiple if not share_vocab else 1)
+
+    if fields.get("corpus_id", False):
+        fields["corpus_id"].vocab = fields["corpus_id"].vocab_cls(
+            counters["corpus_id"])
+
+    if data_type == 'text':
+        src_multifield = fields["src"]
+        _build_fv_from_multifield(
+            src_multifield,
+            counters,
+            build_fv_args,
+            size_multiple=vocab_size_multiple if not share_vocab else 1)
+
+        if share_vocab:
+            # `tgt_vocab_size` is ignored when sharing vocabularies
+            logger.info(" * merging src and tgt vocab...")
+            src_field = src_multifield.base_field
+            tgt_field = tgt_multifield.base_field
+            _merge_field_vocabs(
+                src_field, tgt_field, vocab_size=src_vocab_size,
+                min_freq=src_words_min_frequency,
+                vocab_size_multiple=vocab_size_multiple)
+            logger.info(" * merged vocab size: %d." % len(src_field.vocab))
+            # `tgt_vocab_size` is ignored when sharing vocabularies
+
+        build_noise_field(
+            src_multifield.base_field,
+            subword_prefix=subword_prefix,
+            is_joiner=subword_prefix_is_joiner)
+    return fields
+
+
+def build_noise_field(src_field, subword=True,
+                      subword_prefix="▁", is_joiner=False,
+                      sentence_breaks=[".", "?", "!"]):
+    """In place add noise related fields i.e.:
+         - word_start
+         - end_of_sentence
+    """
+    if subword:
+        def is_word_start(x): return (x.startswith(subword_prefix) ^ is_joiner)
+        sentence_breaks = [subword_prefix + t for t in sentence_breaks]
+    else:
+        def is_word_start(x): return True
+
+    vocab_size = len(src_field.vocab)
+    word_start_mask = torch.zeros([vocab_size]).bool()
+    end_of_sentence_mask = torch.zeros([vocab_size]).bool()
+    for i, t in enumerate(src_field.vocab.itos):
+        if is_word_start(t):
+            word_start_mask[i] = True
+        if t in sentence_breaks:
+            end_of_sentence_mask[i] = True
+    src_field.word_start_mask = word_start_mask
+    src_field.end_of_sentence_mask = end_of_sentence_mask
+
+
+def build_vocab(train_dataset_files, fields, data_type, share_vocab,
+                src_vocab_path, src_vocab_size, src_words_min_frequency,
+                tgt_vocab_path, tgt_vocab_size, tgt_words_min_frequency,
+                vocab_size_multiple=1):
+    """Build the fields for all data sides.
+
+    Args:
+        train_dataset_files: a list of train dataset pt file.
+        fields (dict[str, Field]): fields to build vocab for.
+        data_type (str): A supported data type string.
+        share_vocab (bool): share source and target vocabulary?
+        src_vocab_path (str): Path to src vocabulary file.
+        src_vocab_size (int): size of the source vocabulary.
+        src_words_min_frequency (int): the minimum frequency needed to
+            include a source word in the vocabulary.
+        tgt_vocab_path (str): Path to tgt vocabulary file.
+        tgt_vocab_size (int): size of the target vocabulary.
+        tgt_words_min_frequency (int): the minimum frequency needed to
+            include a target word in the vocabulary.
+        vocab_size_multiple (int): ensure that the vocabulary size is a
+            multiple of this value.
+
+    Returns:
+        Dict of Fields
+    """
+
+    counters = defaultdict(Counter)
+
+    if src_vocab_path:
+        try:
+            logger.info("Using existing vocabulary...")
+            vocab = torch.load(src_vocab_path)
+            # return vocab to dump with standard name
+            return vocab
+        except torch.serialization.pickle.UnpicklingError:
+            logger.info("Building vocab from text file...")
+            # empty train_dataset_files so that vocab is only loaded from
+            # given paths in src_vocab_path, tgt_vocab_path
+            train_dataset_files = []
+
+    # Load vocabulary
+    if src_vocab_path:
+        src_vocab, src_vocab_size = _load_vocab(
+            src_vocab_path, "src", counters,
+            src_words_min_frequency)
+    else:
+        src_vocab = None
+
+    if tgt_vocab_path:
+        tgt_vocab, tgt_vocab_size = _load_vocab(
+            tgt_vocab_path, "tgt", counters,
+            tgt_words_min_frequency)
+    else:
+        tgt_vocab = None
+
+    for i, path in enumerate(train_dataset_files):
+        dataset = torch.load(path)
+        logger.info(" * reloading %s." % path)
+        for ex in dataset.examples:
+            for name, field in fields.items():
+                try:
+                    f_iter = iter(field)
+                except TypeError:
+                    f_iter = [(name, field)]
+                    all_data = [getattr(ex, name, None)]
+                else:
+                    all_data = getattr(ex, name)
+                for (sub_n, sub_f), fd in zip(
+                        f_iter, all_data):
+                    has_vocab = (sub_n == 'src' and src_vocab) or \
+                                (sub_n == 'tgt' and tgt_vocab)
+                    if sub_f.sequential and not has_vocab:
+                        val = fd
+                        counters[sub_n].update(val)
+
+        # Drop the none-using from memory but keep the last
+        if i < len(train_dataset_files) - 1:
+            dataset.examples = None
+            gc.collect()
+            del dataset.examples
+            gc.collect()
+            del dataset
+            gc.collect()
+
+    fields = _build_fields_vocab(
+        fields, counters, data_type,
+        share_vocab, vocab_size_multiple,
+        src_vocab_size, src_words_min_frequency,
+        tgt_vocab_size, tgt_words_min_frequency)
+
+    return fields  # is the return necessary?
+
+
+def _merge_field_vocabs(src_field, tgt_field, vocab_size, min_freq,
+                        vocab_size_multiple):
+    # in the long run, shouldn't it be possible to do this by calling
+    # build_vocab with both the src and tgt data?
+    specials = [tgt_field.unk_token, tgt_field.pad_token,
+                tgt_field.init_token, tgt_field.eos_token]
+    merged = sum(
+        [src_field.vocab.freqs, tgt_field.vocab.freqs], Counter()
+    )
+    merged_vocab = Vocab(
+        merged, specials=specials,
+        max_size=vocab_size, min_freq=min_freq
+    )
+    if vocab_size_multiple > 1:
+        _pad_vocab_to_multiple(merged_vocab, vocab_size_multiple)
+    src_field.vocab = merged_vocab
+    tgt_field.vocab = merged_vocab
+    assert len(src_field.vocab) == len(tgt_field.vocab)
+
+
+def _read_vocab_file(vocab_path, tag):
+    """Loads a vocabulary from the given path.
+
+    Args:
+        vocab_path (str): Path to utf-8 text file containing vocabulary.
+            Each token should be on a line by itself. Tokens must not
+            contain whitespace (else only before the whitespace
+            is considered).
+        tag (str): Used for logging which vocab is being read.
+    """
+
+    logger.info("Loading {} vocabulary from {}".format(tag, vocab_path))
+
+    if not os.path.exists(vocab_path):
+        raise RuntimeError(
+            "{} vocabulary not found at {}".format(tag, vocab_path))
+    else:
+        with codecs.open(vocab_path, 'r', 'utf-8') as f:
+            return [line.strip().split()[0] for line in f if line.strip()]
+
+
+def batch_iter(data, batch_size, batch_size_fn=None, batch_size_multiple=1):
+    """Yield elements from data in chunks of batch_size, where each chunk size
+    is a multiple of batch_size_multiple.
+
+    This is an extended version of torchtext.data.batch.
+    """
+    if batch_size_fn is None:
+        def batch_size_fn(new, count, sofar):
+            return count
+    minibatch, size_so_far = [], 0
+    for ex in data:
+        minibatch.append(ex)
+        size_so_far = batch_size_fn(ex, len(minibatch), size_so_far)
+        if size_so_far >= batch_size:
+            overflowed = 0
+            if size_so_far > batch_size:
+                overflowed += 1
+            if batch_size_multiple > 1:
+                overflowed += (
+                    (len(minibatch) - overflowed) % batch_size_multiple)
+            if overflowed == 0:
+                yield minibatch
+                minibatch, size_so_far = [], 0
+            else:
+                if overflowed == len(minibatch):
+                    logger.warning(
+                        "An example was ignored, more tokens"
+                        " than allowed by tokens batch_size")
+                else:
+                    yield minibatch[:-overflowed]
+                    minibatch = minibatch[-overflowed:]
+                    size_so_far = 0
+                    for i, ex in enumerate(minibatch):
+                        size_so_far = batch_size_fn(ex, i + 1, size_so_far)
+    if minibatch:
+        yield minibatch
+
+
+def _pool(data, batch_size, batch_size_fn, batch_size_multiple,
+          sort_key, random_shuffler, pool_factor):
+    for p in torchtext.data.batch(
+            data, batch_size * pool_factor,
+            batch_size_fn=batch_size_fn):
+        p_batch = list(batch_iter(
+            sorted(p, key=sort_key),
+            batch_size,
+            batch_size_fn=batch_size_fn,
+            batch_size_multiple=batch_size_multiple))
+        for b in random_shuffler(p_batch):
+            yield b
+
+
+class OrderedIterator(torchtext.data.Iterator):
+
+    def __init__(self,
+                 dataset,
+                 batch_size,
+                 pool_factor=1,
+                 batch_size_multiple=1,
+                 yield_raw_example=False,
+                 **kwargs):
+        super(OrderedIterator, self).__init__(dataset, batch_size, **kwargs)
+        self.batch_size_multiple = batch_size_multiple
+        self.yield_raw_example = yield_raw_example
+        self.dataset = dataset
+        self.pool_factor = pool_factor
+
+    def create_batches(self):
+        if self.train:
+            if self.yield_raw_example:
+                self.batches = batch_iter(
+                    self.data(),
+                    1,
+                    batch_size_fn=None,
+                    batch_size_multiple=1)
+            else:
+                self.batches = _pool(
+                    self.data(),
+                    self.batch_size,
+                    self.batch_size_fn,
+                    self.batch_size_multiple,
+                    self.sort_key,
+                    self.random_shuffler,
+                    self.pool_factor)
+        else:
+            self.batches = []
+            for b in batch_iter(
+                    self.data(),
+                    self.batch_size,
+                    batch_size_fn=self.batch_size_fn,
+                    batch_size_multiple=self.batch_size_multiple):
+                self.batches.append(sorted(b, key=self.sort_key))
+
+    def __iter__(self):
+        """
+        Extended version of the definition in torchtext.data.Iterator.
+        Added yield_raw_example behaviour to yield a torchtext.data.Example
+        instead of a torchtext.data.Batch object.
+        """
+        while True:
+            self.init_epoch()
+            
+            for idx, minibatch in enumerate(self.batches):
+                # fast-forward if loaded from state
+                if self._iterations_this_epoch > idx:
+                    continue
+                self.iterations += 1
+                self._iterations_this_epoch += 1
+                if self.sort_within_batch:
+                    # NOTE: `rnn.pack_padded_sequence` requires that a
+                    # minibatch be sorted by decreasing order, which
+                    #  requires reversing relative to typical sort keys
+                    if self.sort:
+                        minibatch.reverse()
+                    else:
+                        minibatch.sort(key=self.sort_key, reverse=True)
+                if self.yield_raw_example:
+                    yield minibatch[0]
+                else:
+                    yield torchtext.data.Batch(
+                        minibatch,
+                        self.dataset,
+                        self.device)
+            if not self.repeat:
+                return
+
+
+class MultipleDatasetIterator(object):
+    """
+    This takes a list of iterable objects (DatasetLazyIter) and their
+    respective weights, and yields a batch in the wanted proportions.
+    """
+    def __init__(self,
+                 train_shards,
+                 fields,
+                 device,
+                 opt):
+        self.index = -1
+        self.iterables = []
+        for shard in train_shards:
+            self.iterables.append(
+                build_dataset_iter(shard, fields, opt, multi=True))
+        self.init_iterators = True
+        self.weights = opt.data_weights
+        self.batch_size = opt.batch_size
+        self.batch_size_fn = max_tok_len \
+            if opt.batch_type == "tokens" else None
+        self.batch_size_multiple = 8 if opt.model_dtype == "fp16" else 1
+        self.device = device
+        # Temporarily load one shard to retrieve sort_key for data_type
+        temp_dataset = torch.load(self.iterables[0]._paths[0])
+        self.sort_key = temp_dataset.sort_key
+        self.random_shuffler = RandomShuffler()
+        self.pool_factor = opt.pool_factor
+        del temp_dataset
+
+    def _iter_datasets(self):
+        if self.init_iterators:
+            self.iterators = [iter(iterable) for iterable in self.iterables]
+            self.init_iterators = False
+        for weight in self.weights:
+            self.index = (self.index + 1) % len(self.iterators)
+            for i in range(weight):
+                yield self.iterators[self.index]
+
+    def _iter_examples(self):
+        for iterator in cycle(self._iter_datasets()):
+            yield next(iterator)
+
+    def __iter__(self):
+        while True:
+            for minibatch in _pool(
+                    self._iter_examples(),
+                    self.batch_size,
+                    self.batch_size_fn,
+                    self.batch_size_multiple,
+                    self.sort_key,
+                    self.random_shuffler,
+                    self.pool_factor):
+                minibatch = sorted(minibatch, key=self.sort_key, reverse=True)
+                yield torchtext.data.Batch(minibatch,
+                                           self.iterables[0].dataset,
+                                           self.device)
+
+
+class DatasetLazyIter(object):
+    """Yield data from sharded dataset files.
+
+    Args:
+        dataset_paths: a list containing the locations of dataset files.
+        fields (dict[str, Field]): fields dict for the
+            datasets.
+        batch_size (int): batch size.
+        batch_size_fn: custom batch process function.
+        device: See :class:`OrderedIterator` ``device``.
+        is_train (bool): train or valid?
+    """
+
+    def __init__(self, dataset_paths, fields, batch_size, batch_size_fn,
+                 batch_size_multiple, device, is_train, pool_factor,
+                 repeat=True, num_batches_multiple=1, yield_raw_example=False):
+        self._paths = dataset_paths
+        self.fields = fields
+        self.batch_size = batch_size
+        self.batch_size_fn = batch_size_fn
+        self.batch_size_multiple = batch_size_multiple
+        self.device = device
+        self.is_train = is_train
+        self.repeat = repeat
+        self.num_batches_multiple = num_batches_multiple
+        self.yield_raw_example = yield_raw_example
+        self.pool_factor = pool_factor
+
+    def _iter_dataset(self, path):
+        cur_dataset = torch.load(path)
+        logger.info('Loading dataset from %s (number of examples: %d)' % (path, len(cur_dataset)))
+        cur_dataset.fields = self.fields
+        cur_iter = OrderedIterator(
+            dataset=cur_dataset,
+            batch_size=self.batch_size,
+            pool_factor=self.pool_factor,
+            batch_size_multiple=self.batch_size_multiple,
+            batch_size_fn=self.batch_size_fn,
+            device=self.device,
+            train=self.is_train,
+            sort=False,
+            sort_within_batch=True,
+            repeat=False,
+            yield_raw_example=self.yield_raw_example
+        )
+
+        for batch in cur_iter:
+            self.dataset = cur_iter.dataset
+            yield batch
+
+        # NOTE: This is causing some issues for consumer/producer,
+        # as we may still have some of those examples in some queue
+        # cur_dataset.examples = None
+        # gc.collect()
+        # del cur_dataset
+        # gc.collect()
+
+    def __iter__(self):
+        num_batches = 0
+        paths = self._paths
+        if self.is_train and self.repeat:
+            # Cycle through the shards indefinitely.
+            paths = cycle(paths)
+        for path in paths:
+            for batch in self._iter_dataset(path):
+                yield batch
+                num_batches += 1
+        if self.is_train and not self.repeat and \
+           num_batches % self.num_batches_multiple != 0:
+            # When the dataset is not repeated, we might need to ensure that
+            # the number of returned batches is the multiple of a given value.
+            # This is important for multi GPU training to ensure that all
+            # workers have the same number of batches to process.
+            for path in paths:
+                for batch in self._iter_dataset(path):
+                    yield batch
+                    num_batches += 1
+                    if num_batches % self.num_batches_multiple == 0:
+                        return
+
+
+def max_tok_len(new, count, sofar):
+    """
+    In token batching scheme, the number of sequences is limited
+    such that the total number of src/tgt tokens (including padding)
+    in a batch <= batch_size
+    """
+    # Maintains the longest src and tgt length in the current batch
+    global max_src_in_batch, max_tgt_in_batch  # this is a hack
+    # Reset current longest length at a new batch (count=1)
+    if count == 1:
+        max_src_in_batch = 0
+        max_tgt_in_batch = 0
+    # Src: [<bos> w1 ... wN <eos>]
+    max_src_in_batch = max(max_src_in_batch, len(new.src[0]) + 2)
+    # Tgt: [w1 ... wM <eos>]
+    max_tgt_in_batch = max(max_tgt_in_batch, len(new.tgt[0]) + 1)
+    src_elements = count * max_src_in_batch
+    tgt_elements = count * max_tgt_in_batch
+    return max(src_elements, tgt_elements)
+
+
+def build_dataset_iter(corpus_type, fields, opt, is_train=True, multi=False):
+    """
+    This returns user-defined train/validate data iterator for the trainer
+    to iterate over. We implement simple ordered iterator strategy here,
+    but more sophisticated strategy like curriculum learning is ok too.
+    """
+    dataset_glob = opt.data + '.' + corpus_type + '.[0-9]*.pt'
+    dataset_paths = list(sorted(
+        glob.glob(dataset_glob),
+        key=lambda p: int(p.split(".")[-2])))
+
+    if not dataset_paths:
+        if is_train:
+            raise ValueError('Training data %s not found' % dataset_glob)
+        else:
+            return None
+    if multi:
+        batch_size = 1
+        batch_fn = None
+        batch_size_multiple = 1
+    else:
+        batch_size = opt.batch_size if is_train else opt.valid_batch_size
+        batch_fn = max_tok_len \
+            if is_train and opt.batch_type == "tokens" else None
+        batch_size_multiple = 8 if opt.model_dtype == "fp16" else 1
+
+    device = "cuda" if opt.gpu_ranks else "cpu"
+
+    return DatasetLazyIter(
+        dataset_paths,
+        fields,
+        batch_size,
+        batch_fn,
+        batch_size_multiple,
+        device,
+        is_train,
+        opt.pool_factor,
+        repeat=not opt.single_pass,
+        num_batches_multiple=max(opt.accum_count) * opt.world_size,
+        yield_raw_example=multi)
+
+
+def build_dataset_iter_multiple(train_shards, fields, opt):
+    return MultipleDatasetIterator(
+        train_shards, fields, "cuda" if opt.gpu_ranks else "cpu", opt)
+
+#==================================================================
+# text_dataset.py
+# -*- coding: utf-8 -*-
+from functools import partial
+
+import six
+import torch
+from torchtext.data import Field, RawField
+
+from onmt.inputters.datareader_base import DataReaderBase
+
+from onmt.utils.logging import logger
+
+class TextDataReader(DataReaderBase):
+    def read(self, sequences, side, _dir=None):
+        """Read text data from disk.
+
+        Args:
+            sequences (str or Iterable[str]):
+                path to text file or iterable of the actual text data.
+            side (str): Prefix used in return dict. Usually
+                ``"src"`` or ``"tgt"``.
+            _dir (NoneType): Leave as ``None``. This parameter exists to
+                conform with the :func:`DataReaderBase.read()` signature.
+
+        Yields:
+            dictionaries whose keys are the names of fields and whose
+            values are more or less the result of tokenizing with those
+            fields.
+        """
+        assert _dir is None or _dir == "", \
+            "Cannot use _dir with TextDataReader."
+        if isinstance(sequences, str):
+            sequences = DataReaderBase._read_file(sequences)
+        for i, seq in enumerate(sequences):
+            if isinstance(seq, six.binary_type):
+                seq = seq.decode("utf-8")
+            yield {side: seq, "indices": i}
+
+
+def text_sort_key(ex):
+    """Sort using the number of tokens in the sequence."""
+    if hasattr(ex, "tgt"):
+        return len(ex.src[0]), len(ex.tgt[0])
+    return len(ex.src[0])
+
+
+# mix this with partial
+def _feature_tokenize(
+        string, layer=0, tok_delim=None, feat_delim=None, truncate=None):
+    """Split apart word features (like POS/NER tags) from the tokens.
+
+    Args:
+        string (str): A string with ``tok_delim`` joining tokens and
+            features joined by ``feat_delim``. For example,
+            ``"hello|NOUN|'' Earth|NOUN|PLANET"``.
+        layer (int): Which feature to extract. (Not used if there are no
+            features, indicated by ``feat_delim is None``). In the
+            example above, layer 2 is ``'' PLANET``.
+        truncate (int or NoneType): Restrict sequences to this length of
+            tokens.
+
+    Returns:
+        List[str] of tokens.
+    """
+
+    tokens = string.split(tok_delim)
+    if truncate is not None:
+        tokens = tokens[:truncate]
+    if feat_delim is not None:
+        tokens = [t.split(feat_delim)[layer] for t in tokens]
+    return tokens
+
+
+class TextMultiField(RawField):
+    """Container for subfields.
+
+    Text data might use POS/NER/etc labels in addition to tokens.
+    This class associates the "base" :class:`Field` with any subfields.
+    It also handles padding the data and stacking it.
+
+    Args:
+        base_name (str): Name for the base field.
+        base_field (Field): The token field.
+        feats_fields (Iterable[Tuple[str, Field]]): A list of name-field
+            pairs.
+
+    Attributes:
+        fields (Iterable[Tuple[str, Field]]): A list of name-field pairs.
+            The order is defined as the base field first, then
+            ``feats_fields`` in alphabetical order.
+    """
+
+    def __init__(self, base_name, base_field, feats_fields):
+        super(TextMultiField, self).__init__()
+        self.fields = [(base_name, base_field)]
+        for name, ff in sorted(feats_fields, key=lambda kv: kv[0]):
+            self.fields.append((name, ff))
+
+    @property
+    def base_field(self):
+        return self.fields[0][1]
+
+    def process(self, batch, device=None):
+        """Convert outputs of preprocess into Tensors.
+
+        Args:
+            batch (List[List[List[str]]]): A list of length batch size.
+                Each element is a list of the preprocess results for each
+                field (which are lists of str "words" or feature tags.
+            device (torch.device or str): The device on which the tensor(s)
+                are built.
+
+        Returns:
+            torch.LongTensor or Tuple[LongTensor, LongTensor]:
+                A tensor of shape ``(seq_len, batch_size, len(self.fields))``
+                where the field features are ordered like ``self.fields``.
+                If the base field returns lengths, these are also returned
+                and have shape ``(batch_size,)``.
+        """
+
+        # batch (list(list(list))): batch_size x len(self.fields) x seq_len
+        batch_by_feat = list(zip(*batch))
+        base_data = self.base_field.process(batch_by_feat[0], device=device)
+        if self.base_field.include_lengths:
+            # lengths: batch_size
+            base_data, lengths = base_data
+
+        feats = [ff.process(batch_by_feat[i], device=device)
+                 for i, (_, ff) in enumerate(self.fields[1:], 1)]
+        levels = [base_data] + feats
+        # data: seq_len x batch_size x len(self.fields)
+        data = torch.stack(levels, 2)
+        if self.base_field.include_lengths:
+            return data, lengths
+        else:
+            return data
+
+    def preprocess(self, x):
+        """Preprocess data.
+
+        Args:
+            x (str): A sentence string (words joined by whitespace).
+
+        Returns:
+            List[List[str]]: A list of length ``len(self.fields)`` containing
+                lists of tokens/feature tags for the sentence. The output
+                is ordered like ``self.fields``.
+        """
+
+        return [f.preprocess(x) for _, f in self.fields]
+
+    def __getitem__(self, item):
+        return self.fields[item]
+
+
+def text_fields(**kwargs):
+    """Create text fields.
+
+    Args:
+        base_name (str): Name associated with the field.
+        n_feats (int): Number of word level feats (not counting the tokens)
+        include_lengths (bool): Optionally return the sequence lengths.
+        pad (str, optional): Defaults to ``"<blank>"``.
+        bos (str or NoneType, optional): Defaults to ``"<s>"``.
+        eos (str or NoneType, optional): Defaults to ``"</s>"``.
+        truncate (bool or NoneType, optional): Defaults to ``None``.
+
+    Returns:
+        TextMultiField
+    """
+
+    use_vocab = kwargs["use_vocab"]
+    n_feats = kwargs["n_feats"]
+    include_lengths = kwargs["include_lengths"]
+    base_name = kwargs["base_name"]
+    pad = kwargs.get("pad", "<blank>")
+    bos = kwargs.get("bos", "<s>")
+    eos = kwargs.get("eos", "</s>")
+    truncate = kwargs.get("truncate", None)
+    fields_ = []
+    feat_delim = u"￨" if n_feats > 0 else None
+    for i in range(n_feats + 1):
+        name = base_name + "_feat_" + str(i - 1) if i > 0 else base_name
+        tokenize = partial(
+            _feature_tokenize,
+            layer=i,
+            truncate=truncate,
+            feat_delim=feat_delim)
+        use_len = i == 0 and include_lengths
+        feat = Field(
+            init_token=bos, eos_token=eos,
+            pad_token=pad, tokenize=tokenize,
+            include_lengths=use_len, use_vocab=use_vocab)
+        fields_.append((name, feat))
+    assert fields_[0][0] == base_name  # sanity check
+    field = TextMultiField(fields_[0][0], fields_[0][1], fields_[1:])
+    return field
+
+#==================================================================
+# vec_dataset.py
+import os
+
+import torch
+from torchtext.data import Field
+
+from onmt.inputters.datareader_base import DataReaderBase
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+
+class VecDataReader(DataReaderBase):
+    """Read feature vector data from disk.
+    Raises:
+        onmt.inputters.datareader_base.MissingDependencyException: If
+            importing ``np`` fails.
+    """
+
+    def __init__(self):
+        self._check_deps()
+
+    @classmethod
+    def _check_deps(cls):
+        if np is None:
+            cls._raise_missing_dep("np")
+
+    def read(self, vecs, side, vec_dir=None):
+        """Read data into dicts.
+        Args:
+            vecs (str or Iterable[str]): Sequence of feature vector paths or
+                path to file containing feature vector paths.
+                In either case, the filenames may be relative to ``vec_dir``
+                (default behavior) or absolute.
+            side (str): Prefix used in return dict. Usually
+                ``"src"`` or ``"tgt"``.
+            vec_dir (str): Location of source vectors. See ``vecs``.
+        Yields:
+            A dictionary containing feature vector data.
+        """
+
+        if isinstance(vecs, str):
+            vecs = DataReaderBase._read_file(vecs)
+
+        # for i, filename in enumerate(vecs):
+        #     filename = filename.decode("utf-8").strip()
+        #     vec_path = os.path.join(vec_dir, filename)
+        #     if not os.path.exists(vec_path):
+        #         vec_path = filename
+
+        #     assert os.path.exists(vec_path), \
+        #         'vec path %s not found' % filename
+
+        #     vec = np.load(vec_path)
+        #     yield {side: torch.from_numpy(vec),
+        #            side + "_path": filename, "indices": i}
+
+        for i, vec in enumerate(vecs):
+            vec = np.array(vec.strip().split(), dtype=int)
+            yield {side: torch.from_numpy(vec),
+                   "indices": i}
+
+
+def vec_sort_key(ex):
+    """Sort using the length of the vector sequence."""
+    return ex.src.shape[0]
+
+
+class VecSeqField(Field):
+    """Defines an vector datatype and instructions for converting to Tensor.
+    See :class:`Fields` for attribute descriptions.
+    """
+
+    def __init__(self, preprocessing=None, postprocessing=None,
+                 include_lengths=False, batch_first=False, pad_index=0,
+                 is_target=False):
+        super(VecSeqField, self).__init__(
+            sequential=True, use_vocab=False, init_token=None,
+            eos_token=None, fix_length=False, dtype=torch.float,
+            preprocessing=preprocessing, postprocessing=postprocessing,
+            lower=False, tokenize=None, include_lengths=include_lengths,
+            batch_first=batch_first, pad_token=pad_index, unk_token=None,
+            pad_first=False, truncate_first=False, stop_words=None,
+            is_target=is_target
+        )
+
+    def pad(self, minibatch):
+        """Pad a batch of examples to the length of the longest example.
+        Args:
+            minibatch (List[torch.FloatTensor]): A list of audio data,
+                each having shape ``(len, n_feats, feat_dim)``
+                where len is variable.
+        Returns:
+            torch.FloatTensor or Tuple[torch.FloatTensor, List[int]]: The
+                padded tensor of shape
+                ``(batch_size, max_len, n_feats, feat_dim)``.
+                and a list of the lengths if `self.include_lengths` is `True`
+                else just returns the padded tensor.
+        """
+
+        assert not self.pad_first and not self.truncate_first \
+            and not self.fix_length and self.sequential
+        
+        lengths = [x.size(0) + 2 for x in minibatch]
+        max_len = max(lengths)
+        feats = torch.full((max_len, len(minibatch), 1), 
+                           self.pad_token, dtype=torch.int64)
+
+        for i, (feat, len_) in enumerate(zip(minibatch, lengths)):
+            feats[1:len_-1, i, 0] = feat
+        if self.include_lengths:
+            return (feats, lengths)
+        return feats
+
+    def numericalize(self, arr, device=None):
+        """Turn a batch of examples that use this field into a Variable.
+        If the field has ``include_lengths=True``, a tensor of lengths will be
+        included in the return value.
+        Args:
+            arr (torch.FloatTensor or Tuple(torch.FloatTensor, List[int])):
+                List of tokenized and padded examples, or tuple of List of
+                tokenized and padded examples and List of lengths of each
+                example if self.include_lengths is True.
+            device (str or torch.device): See `Field.numericalize`.
+        """
+
+        assert self.use_vocab is False
+        if self.include_lengths and not isinstance(arr, tuple):
+            raise ValueError("Field has include_lengths set to True, but "
+                             "input data is not a tuple of "
+                             "(data batch, batch lengths).")
+        if isinstance(arr, tuple):
+            arr, lengths = arr
+            lengths = torch.tensor(lengths, dtype=torch.int, device=device)
+        arr = arr.to(device)
+
+        if self.postprocessing is not None:
+            arr = self.postprocessing(arr, None)
+
+        # if self.sequential and not self.batch_first:
+        #     arr = arr.permute(1, 0, 2, 3)
+        if self.sequential:
+            arr = arr.contiguous()
+
+        if self.include_lengths:
+            return arr, lengths
+        return arr
+
+
+def vec_fields(**kwargs):
+    vec = VecSeqField(pad_index=0, include_lengths=True)
+    return vec
+
+#==================================================================
+# model.py
+""" Onmt NMT Model base class definition """
+import torch.nn as nn
+import torch
+
+class NMTModel(nn.Module):
+    """
+    Core trainable object in OpenNMT. Implements a trainable interface
+    for a simple, generic encoder + decoder model.
+
+    Args:
+      encoder (onmt.encoders.EncoderBase): an encoder object
+      decoder (onmt.decoders.DecoderBase): a decoder object
+    """
+
+    def __init__(self, encoder, decoder):
+        super(NMTModel, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def forward(self, src, lengths, tgt, idx, with_align=False):
+        """Forward propagate a `src` and `tgt` pair for training.
+        Possible initialized with a beginning decoder state.
+
+        Args:
+            src (Tensor): A source sequence passed to encoder.
+                typically for inputs this will be a padded `LongTensor`
+                of size ``(len, batch, features)``. However, may be an
+                image or other generic input depending on encoder.
+            tgt (LongTensor): A target sequence passed to decoder.
+                Size ``(tgt_len, batch, features)``.
+            lengths(LongTensor): The src lengths, pre-padding ``(batch,)``.
+            bptt (Boolean): A flag indicating if truncated bptt is set.
+                If reset then init_state
+            with_align (Boolean): A flag indicating whether output alignment,
+                Only valid for transformer decoder.
+
+        Returns:
+            (FloatTensor, dict[str, FloatTensor]):
+
+            * decoder output ``(tgt_len, batch, hidden)``
+            * dictionary attention dists of ``(tgt_len, batch, src_len)``
+        """
+
+        # print('===' * 10)
+        
+        # print(src.shape, tgt.shape, idx.shape)
+        # print(src.dtype, tgt.dtype, idx.dtype)
+        
+        # print(src[:, -1].squeeze())
+        # print(tgt[:, -1].squeeze())
+        # print(idx[:, -1].squeeze())
+        # print('===' * 10)
+
+        # is_gen, tgt_cop, tgt_gen = self.get_new_target(tgt, tgt_nbr, src_nbr)
+
+        # print(is_gen[:, 0].squeeze())
+        # print(tgt_cop[:, 0].squeeze())
+        # print(tgt_gen[:, 0].squeeze())
+        
+        # print('===')
+
+        # return
+
+        ##################################################################
+
+        enc_state, memory_bank, lengths = self.encoder(src, lengths)
+
+        self.decoder.init_state(src, memory_bank, enc_state)
+        dec_state, dec_out, attns = self.decoder(
+            tgt[:-1], idx[:-1], memory_bank,
+            memory_lengths=lengths,
+            with_align=with_align)
+
+        vocab_dist = self.generator(dec_out)    # (TL-1, B, V)
+
+        ##################################################################
+        
+        a_context = attns['avg']        # (TL-1, B, SL)
+        attn_dist = attns['cop']           # (TL-1, B, SL)
+
+        h_star = torch.bmm(
+            a_context.transpose(0, 1),  # (B, TL-1, SL)
+            memory_bank.transpose(0, 1)   # (B, SL, model_dim)
+        ).transpose(0, 1)       # (TL-1, B, model_dim)
+        p_gen_input = torch.cat((h_star, dec_out, dec_state), 2)
+        p_gen = self.pgen(p_gen_input) # (TL-1, B, 1)
+
+        return p_gen, vocab_dist, attn_dist
+
+    def update_dropout(self, dropout):
+        self.encoder.update_dropout(dropout)
+        self.decoder.update_dropout(dropout)
+
+#==================================================================
+# beam_search.py
+import torch
+from onmt.translate import penalties
+from onmt.translate.decode_strategy import DecodeStrategy
+from onmt.utils.misc import tile
+
+import warnings
+
+
+class BeamSearch(DecodeStrategy):
+    """Generation beam search.
+
+    Note that the attributes list is not exhaustive. Rather, it highlights
+    tensors to document their shape. (Since the state variables' "batch"
+    size decreases as beams finish, we denote this axis with a B rather than
+    ``batch_size``).
+
+    Args:
+        beam_size (int): Number of beams to use (see base ``parallel_paths``).
+        batch_size (int): See base.
+        pad (int): See base.
+        bos (int): See base.
+        eos (int): See base.
+        n_best (int): Don't stop until at least this many beams have
+            reached EOS.
+        global_scorer (onmt.translate.GNMTGlobalScorer): Scorer instance.
+        min_length (int): See base.
+        max_length (int): See base.
+        return_attention (bool): See base.
+        block_ngram_repeat (int): See base.
+        exclusion_tokens (set[int]): See base.
+
+    Attributes:
+        top_beam_finished (ByteTensor): Shape ``(B,)``.
+        _batch_offset (LongTensor): Shape ``(B,)``.
+        _beam_offset (LongTensor): Shape ``(batch_size x beam_size,)``.
+        alive_seq (LongTensor): See base.
+        topk_log_probs (FloatTensor): Shape ``(B x beam_size,)``. These
+            are the scores used for the topk operation.
+        memory_lengths (LongTensor): Lengths of encodings. Used for
+            masking attentions.
+        select_indices (LongTensor or NoneType): Shape
+            ``(B x beam_size,)``. This is just a flat view of the
+            ``_batch_index``.
+        topk_scores (FloatTensor): Shape
+            ``(B, beam_size)``. These are the
+            scores a sequence will receive if it finishes.
+        topk_ids (LongTensor): Shape ``(B, beam_size)``. These are the
+            word indices of the topk predictions.
+        _batch_index (LongTensor): Shape ``(B, beam_size)``.
+        _prev_penalty (FloatTensor or NoneType): Shape
+            ``(B, beam_size)``. Initialized to ``None``.
+        _coverage (FloatTensor or NoneType): Shape
+            ``(1, B x beam_size, inp_seq_len)``.
+        hypotheses (list[list[Tuple[Tensor]]]): Contains a tuple
+            of score (float), sequence (long), and attention (float or None).
+    """
+
+    def __init__(self, beam_size, batch_size, pad, bos, eos, n_best,
+                 global_scorer, min_length, max_length, return_attention,
+                 block_ngram_repeat, exclusion_tokens,
+                 stepwise_penalty, ratio):
+        super(BeamSearch, self).__init__(
+            pad, bos, eos, batch_size, beam_size, min_length,
+            block_ngram_repeat, exclusion_tokens, return_attention,
+            max_length)
+        # beam parameters
+        self.global_scorer = global_scorer
+        self.beam_size = beam_size
+        self.n_best = n_best
+        self.ratio = ratio
+
+        # result caching
+        self.hypotheses = [[] for _ in range(batch_size)]
+
+        # beam state
+        self.top_beam_finished = torch.zeros([batch_size], dtype=torch.uint8)
+        # BoolTensor was introduced in pytorch 1.2
+        try:
+            self.top_beam_finished = self.top_beam_finished.bool()
+        except AttributeError:
+            pass
+        self._batch_offset = torch.arange(batch_size, dtype=torch.long)
+
+        self.select_indices = None
+        self.done = False
+        # "global state" of the old beam
+        self._prev_penalty = None
+        self._coverage = None
+
+        self._stepwise_cov_pen = (
+            stepwise_penalty and self.global_scorer.has_cov_pen)
+        self._vanilla_cov_pen = (
+            not stepwise_penalty and self.global_scorer.has_cov_pen)
+        self._cov_pen = self.global_scorer.has_cov_pen
+
+    def initialize(self, memory_bank, src, src_lengths, src_map=None, 
+                   device=None, initial_token=None):
+        """Initialize for decoding.
+        Repeat src objects `beam_size` times.
+        """
+
+        def fn_map_state(state, dim):
+            return tile(state, self.beam_size, dim=dim)
+
+        if isinstance(memory_bank, tuple):
+            memory_bank = tuple(tile(x, self.beam_size, dim=1)
+                                for x in memory_bank)
+            mb_device = memory_bank[0].device
+        else:
+            memory_bank = tile(memory_bank, self.beam_size, dim=1)
+            mb_device = memory_bank.device
+        if src_map is not None:
+            src_map = tile(src_map, self.beam_size, dim=1)
+        if device is None:
+            device = mb_device
+
+        self.memory_lengths = tile(src_lengths, self.beam_size)
+        super(BeamSearch, self).initialize(
+            memory_bank, self.memory_lengths, src_map, device, initial_token)
+        self.best_scores = torch.full(
+            [self.batch_size], -1e10, dtype=torch.float, device=device)
+        self.seen_mask = torch.ones( # [B*b, SL]
+            (self.batch_size * self.beam_size, src.size(0)), 
+            dtype=src.dtype, device=src.device)
+        self.tiled_src = torch.repeat_interleave( # [1, B*b, SL]
+            src.transpose(0, 2), repeats=self.beam_size, dim=1)
+        self._beam_offset = torch.arange(
+            0, self.batch_size * self.beam_size, step=self.beam_size,
+            dtype=torch.long, device=device)
+        self.topk_log_probs = torch.tensor(
+            [0.0] + [float("-inf")] * (self.beam_size - 1), device=device
+        ).repeat(self.batch_size)
+        # buffers for the topk scores and 'backpointer'
+        self.topk_scores = torch.empty((self.batch_size, self.beam_size),
+                                       dtype=torch.float, device=device)
+        self.topk_ids = torch.empty((self.batch_size, self.beam_size),
+                                    dtype=torch.long, device=device)
+        self.topk_ids_cop = torch.empty((self.batch_size, self.beam_size),
+                                        dtype=torch.long, device=device)
+        self._batch_index = torch.empty([self.batch_size, self.beam_size],
+                                        dtype=torch.long, device=device)
+        return fn_map_state, memory_bank, self.memory_lengths, src_map
+
+    @property
+    def current_predictions(self):
+        return self.alive_seq[:, -1]
+
+    @property
+    def current_idx_predictions(self):
+        return self.alive_idx_seq[:, -1]
+
+    @property
+    def current_backptr(self):
+        # for testing
+        return self.select_indices.view(self.batch_size, self.beam_size)\
+            .fmod(self.beam_size)
+
+    @property
+    def batch_offset(self):
+        return self._batch_offset
+
+    def advance(self, p_gen, log_probs_gen, log_probs_cop, attn):
+        # print(self.tiled_src.shape, p_gen.shape, log_probs_gen.shape, log_probs_cop.shape)
+        # print(p_gen[::2])
+        # print(self.tiled_src.squeeze()[:1])
+        # print(p_gen[:1].float())
+        # print(log_probs_gen[:1].float(),
+        #       torch.topk(log_probs_gen[:1].float(),  self.beam_size, dim=-1))
+        # print(log_probs_cop[:1].float(),
+        #       torch.topk(log_probs_cop[:1].float(),  self.beam_size, dim=-1))
+        # print((p_gen * torch.exp(log_probs_gen))[:1].float(),
+        #       torch.topk((p_gen * torch.exp(log_probs_gen))[:1].float(),  self.beam_size, dim=-1))
+        # print(((1-p_gen) * torch.exp(log_probs_cop))[:1].float(),
+        #       torch.topk(((1-p_gen) * torch.exp(log_probs_cop))[:1].float(),  self.beam_size, dim=-1))
+        # print(probs_all[:2])
+        probs = torch.cat([p_gen * torch.exp(log_probs_gen), 
+                           (1-p_gen) * torch.exp(log_probs_cop)], axis=1)
+        log_probs = torch.log(probs)
+
+        vocab_size = log_probs_gen.size(-1)
+        source_size = log_probs_cop.size(-1)
+
+        # using integer division to get an integer _B without casting
+        _B = log_probs.shape[0] // self.beam_size
+
+        if self._stepwise_cov_pen and self._prev_penalty is not None:
+            self.topk_log_probs += self._prev_penalty
+            self.topk_log_probs -= self.global_scorer.cov_penalty(
+                self._coverage + attn, self.global_scorer.beta).view(
+                _B, self.beam_size)
+
+        # force the output to be longer than self.min_length
+        step = len(self)
+        self.ensure_min_length(log_probs)
+
+        # Multiply probs by the beam probability.
+        log_probs += self.topk_log_probs.view(_B * self.beam_size, 1)
+        # print(log_probs)
+        # raise
+
+        # if the sequence ends now, then the penalty is the current
+        # length + 1, to include the EOS token
+        length_penalty = self.global_scorer.length_penalty(
+            step + 1, alpha=self.global_scorer.alpha)
+
+        curr_scores = log_probs / length_penalty
+
+        # Avoid any direction that would repeat unwanted ngrams
+        self.block_ngram_repeats(curr_scores)
+
+        # Flatten probs into a list of possibilities.
+        curr_scores = curr_scores.reshape(
+            _B, self.beam_size * (vocab_size + source_size))
+        torch.topk(curr_scores,  self.beam_size, dim=-1,
+                   out=(self.topk_scores, self.topk_ids))
+
+        # Recover log probs.
+        # Length penalty is just a scalar. It doesn't matter if it's applied
+        # before or after the topk.
+        torch.mul(self.topk_scores, length_penalty, out=self.topk_log_probs)
+
+        # Resolve beam origin and map to batch index flat representation.
+        torch.div(self.topk_ids, (vocab_size + source_size), 
+                  out=self._batch_index)
+        self._batch_index += self._beam_offset[:_B].unsqueeze(1)
+        self.select_indices = self._batch_index.view(_B * self.beam_size)
+        self.topk_ids.fmod_((vocab_size + source_size))  # resolve true word ids
+
+        # print(vocab_size, source_size)
+
+        # split ids into vocab and copy
+        topk_ids_flat = self.topk_ids.view(1, -1, 1) # [1, B * b, 1]
+        # copied_mask = (topk_ids_flat >= vocab_size).long()
+        copied_mask = topk_ids_flat.ge(vocab_size)
+        # first, topk_copied_ids
+        # topk_ids_cop = topk_ids_flat.fmod_(vocab_size) #[0, ..., SL-3] + [-1]
+        topk_ids_cop = torch.fmod(topk_ids_flat, vocab_size)
+        topk_ids_cop = topk_ids_cop.\
+            masked_fill_(~copied_mask, -1) + 1 #[1, ..., SL-2] + [0]
+        self.topk_ids_cop = topk_ids_cop.view(-1, self.beam_size)
+        
+        print(self.topk_ids)
+        # print(self.topk_ids_cop)
+
+
+        # # print(topk_ids_flat[0, :4, 0])
+        # topk_ids_cop = ( 
+        #     topk_ids_flat.fmod_(vocab_size) * copied_mask
+        #     + (-1) * (1-copied_mask))
+        # # print(topk_ids_cop[0, :4, 0])
+        # topk_ids_cop += 1 
+        # # print(topk_ids_cop[0, :4, 0])
+        # self.topk_ids_cop = topk_ids_cop.view(-1, self.beam_size)
+        # print(self.topk_ids_cop[:2])
+        # second, topk_ids
+        topk_ids_copied_vocab = self.tiled_src.gather(dim=2, index=topk_ids_cop)
+        # print(self.tiled_src.squeeze()[:4:2])
+        # print(topk_ids_copied_vocab[0, :4, 0])
+        # raise
+        # print(topk_ids_copied_vocab.view(-1, self.beam_size))
+        self.topk_ids = (
+            topk_ids_flat.masked_fill_(copied_mask, 0)
+            + topk_ids_copied_vocab.masked_fill_(~copied_mask, 0)) \
+                .view(-1, self.beam_size)
+        print(self.topk_ids)
+        # raise
+        # print(self.topk_ids)
+        # print(self.topk_ids_cop)
+
+        # Append last prediction.
+        # new_alive_indices = self.topk_ids.view(_B * self.beam_size, 1)
+        # # print('new_alive_indices', new_alive_indices.squeeze())
+        # copy_mask = (new_alive_indices >= self.n_vocab).int()
+        # new_alive_indices.fmod_(self.n_vocab)
+        # print('===')
+        # print('new_alive_indices', new_alive_indices.squeeze())
+        # print('copy_mask', copy_mask.squeeze())
+        # print(self.tiled_src[:, 0, 0])#, self.tiled_src[:, 1, 0]))
+
+        # # assert (self.tiled_src[:, 0, 0] == self.tiled_src[:, 1, 0]).all(), \
+        # #        (self.tiled_src[:, 0, 0], self.tiled_src[:, 1, 0])
+
+        # # print(new_alive_indices.shape, copy_mask.shape, self.tiled_src.shape, self.alive_seq.index_select(0, self.select_indices).shape)
+        # i = (new_alive_indices * copy_mask).view(1, -1, 1) # (b*B, 1)
+        # new_alive_indices = (
+        #     (1-copy_mask) * new_alive_indices + 
+        #     copy_mask * self.tiled_src.gather(dim=0, index=i)).view(-1, 1)
+        # print('new_alive_indices', new_alive_indices.squeeze())
+        # print('===')
+        
+        # # print('new_alive_indices', new_alive_indices)
+        # # raise
+
+        self.alive_seq = torch.cat(
+            [self.alive_seq.index_select(0, self.select_indices),
+             self.topk_ids.view(_B * self.beam_size, 1)], -1)
+        self.alive_idx_seq = torch.cat(
+            [self.alive_idx_seq.index_select(0, self.select_indices),
+             self.topk_ids_cop.view(_B * self.beam_size, 1)], -1)
+        self.seen_mask[] # #####################
+        print(self.alive_seq)
+
+        print('====')
+        self.maybe_update_forbidden_tokens()
+
+        if self.return_attention or self._cov_pen:
+            current_attn = attn.index_select(1, self.select_indices)
+            if step == 1:
+                self.alive_attn = current_attn
+                # update global state (step == 1)
+                if self._cov_pen:  # coverage penalty
+                    self._prev_penalty = torch.zeros_like(self.topk_log_probs)
+                    self._coverage = current_attn
+            else:
+                self.alive_attn = self.alive_attn.index_select(
+                    1, self.select_indices)
+                self.alive_attn = torch.cat([self.alive_attn, current_attn], 0)
+                # update global state (step > 1)
+                if self._cov_pen:
+                    self._coverage = self._coverage.index_select(
+                        1, self.select_indices)
+                    self._coverage += current_attn
+                    self._prev_penalty = self.global_scorer.cov_penalty(
+                        self._coverage, beta=self.global_scorer.beta).view(
+                            _B, self.beam_size)
+
+        if self._vanilla_cov_pen:
+            # shape: (batch_size x beam_size, 1)
+            cov_penalty = self.global_scorer.cov_penalty(
+                self._coverage,
+                beta=self.global_scorer.beta)
+            self.topk_scores -= cov_penalty.view(_B, self.beam_size).float()
+
+        self.is_finished = self.topk_ids.eq(self.eos)
+        self.ensure_max_length()
+
+    def update_finished(self):
+        # Penalize beams that finished.
+        _B_old = self.topk_log_probs.shape[0]
+        step = self.alive_seq.shape[-1]  # 1 greater than the step in advance
+        self.topk_log_probs.masked_fill_(self.is_finished, -1e10)
+        # on real data (newstest2017) with the pretrained transformer,
+        # it's faster to not move this back to the original device
+        self.is_finished = self.is_finished.to('cpu')
+        self.top_beam_finished |= self.is_finished[:, 0].eq(1)
+        predictions = self.alive_seq.view(_B_old, self.beam_size, step)
+        print(predictions.shape, self.alive_seq.shape, self.alive_idx_seq.shape) #############################
+        predictions_idx = self.alive_idx_seq.view(_B_old, self.beam_size, step)
+        # print(self.tiled_src.size()) # [SL, B * beam, 1]
+        # print(self.tiled_src[:, 0].squeeze())
+        # print(self.tiled_src[:, 1].squeeze())
+        # print(self.tiled_src.view(-1, _B_old, self.beam_size, 1)[:, 0, 0, 0])
+        # print(self.tiled_src.view(-1, _B_old, self.beam_size, 1)[:, 0, 1, 0])
+        # tiled_src: (1, B * b, SL), a_copy: (B*b, SL)
+        tiled_srcs = self.tiled_src.view(1, _B_old, self.beam_size, -1)
+        seen_mask = self.seen_mask.view(_B_old, self.beam_size, -1)
+        # assert (tiled_srcs[:, 0, 0] == tiled_srcs[:, 0, 1]).all()
+        attention = (
+            self.alive_attn.view(
+                step - 1, _B_old, self.beam_size, self.alive_attn.size(-1))
+            if self.alive_attn is not None else None)
+        non_finished_batch = []
+        for i in range(self.is_finished.size(0)):  # Batch level
+            b = self._batch_offset[i]
+            finished_hyp = self.is_finished[i].nonzero().view(-1)
+            # Store finished hypotheses for this batch.
+            for j in finished_hyp:  # Beam level: finished beam j in batch i
+                if self.ratio > 0:
+                    s = self.topk_scores[i, j] / (step + 1)
+                    if self.best_scores[b] < s:
+                        self.best_scores[b] = s
+                self.hypotheses[b].append((
+                    self.topk_scores[i, j],
+                    predictions[i, j, 1:],  # Ignore start_token.
+                    predictions_idx[i, j, 1:],
+                    attention[:, i, j, :self.memory_lengths[i]]
+                    if attention is not None else None))
+            # End condition is the top beam finished and we can return
+            # n_best hypotheses.
+            if self.ratio > 0:
+                pred_len = self.memory_lengths[i] * self.ratio
+                finish_flag = ((self.topk_scores[i, 0] / pred_len)
+                               <= self.best_scores[b]) or \
+                    self.is_finished[i].all()
+            else:
+                finish_flag = self.top_beam_finished[i] != 0
+            if finish_flag and len(self.hypotheses[b]) >= self.n_best:
+                best_hyp = sorted(
+                    self.hypotheses[b], key=lambda x: x[0], reverse=True)
+                for n, (score, pred, pred_idx, attn) in enumerate(best_hyp):
+                    if n >= self.n_best:
+                        break
+                    self.scores[b].append(score)
+                    self.predictions[b].append(pred)  # ``(batch, n_best,)``
+                    self.predictions_idx[b].append(pred_idx)
+                    self.attention[b].append(
+                        attn if attn is not None else [])
+            else:
+                non_finished_batch.append(i)
+        non_finished = torch.tensor(non_finished_batch)
+        # If all sentences are translated, no need to go further.
+        if len(non_finished) == 0:
+            self.done = True
+            return
+
+        _B_new = non_finished.shape[0]
+        # Remove finished batches for the next step.
+        self.top_beam_finished = self.top_beam_finished.index_select(
+            0, non_finished)
+        self._batch_offset = self._batch_offset.index_select(0, non_finished)
+        non_finished = non_finished.to(self.topk_ids.device)
+        self.topk_log_probs = self.topk_log_probs.index_select(0,
+                                                               non_finished)
+        self._batch_index = self._batch_index.index_select(0, non_finished)
+        self.select_indices = self._batch_index.view(_B_new * self.beam_size)
+        # print('---', predictions.shape, non_finished.shape)
+        self.alive_seq = predictions.index_select(0, non_finished) \
+            .view(-1, self.alive_seq.size(-1))
+        self.alive_idx_seq = predictions_idx.index_select(0, non_finished) \
+            .view(-1, self.alive_idx_seq.size(-1))
+            #(_B_old==>new, beam_size, step) ==> (_B_new * beam_size, step)
+        # tiled_src: (1, B * b, SL), a_copy: (B*b, SL)
+        self.tiled_src = tiled_srcs.index_select(1, non_finished) \
+            .view(1, -1, self.tiled_src.size(-1))
+            #(1, _B_old==>new, self.beam_size, -1) ==> (1, beam_size * _B_new, -1)
+        self.seen_mask = seen_mask.index_select(0, non_finished) \
+            .view(-1, self.seen_mask.size(-1))
+            # (_B_old==>new, beam_size, -1) ==> (_B_new * beam_size, -1)
+        self.topk_scores = self.topk_scores.index_select(0, non_finished)
+        # print("---", self.alive_seq.size(), self.tiled_src.size())
+        self.topk_ids = self.topk_ids.index_select(0, non_finished)
+        if self.alive_attn is not None:
+            inp_seq_len = self.alive_attn.size(-1)
+            self.alive_attn = attention.index_select(1, non_finished) \
+                .view(step - 1, _B_new * self.beam_size, inp_seq_len)
+            if self._cov_pen:
+                self._coverage = self._coverage \
+                    .view(1, _B_old, self.beam_size, inp_seq_len) \
+                    .index_select(1, non_finished) \
+                    .view(1, _B_new * self.beam_size, inp_seq_len)
+                if self._stepwise_cov_pen:
+                    self._prev_penalty = self._prev_penalty.index_select(
+                        0, non_finished)
+
+
+class GNMTGlobalScorer(object):
+    """NMT re-ranking.
+
+    Args:
+       alpha (float): Length parameter.
+       beta (float):  Coverage parameter.
+       length_penalty (str): Length penalty strategy.
+       coverage_penalty (str): Coverage penalty strategy.
+
+    Attributes:
+        alpha (float): See above.
+        beta (float): See above.
+        length_penalty (callable): See :class:`penalties.PenaltyBuilder`.
+        coverage_penalty (callable): See :class:`penalties.PenaltyBuilder`.
+        has_cov_pen (bool): See :class:`penalties.PenaltyBuilder`.
+        has_len_pen (bool): See :class:`penalties.PenaltyBuilder`.
+    """
+
+    @classmethod
+    def from_opt(cls, opt):
+        return cls(
+            opt.alpha,
+            opt.beta,
+            opt.length_penalty,
+            opt.coverage_penalty)
+
+    def __init__(self, alpha, beta, length_penalty, coverage_penalty):
+        self._validate(alpha, beta, length_penalty, coverage_penalty)
+        self.alpha = alpha
+        self.beta = beta
+        penalty_builder = penalties.PenaltyBuilder(coverage_penalty,
+                                                   length_penalty)
+        self.has_cov_pen = penalty_builder.has_cov_pen
+        # Term will be subtracted from probability
+        self.cov_penalty = penalty_builder.coverage_penalty
+
+        self.has_len_pen = penalty_builder.has_len_pen
+        # Probability will be divided by this
+        self.length_penalty = penalty_builder.length_penalty
+
+    @classmethod
+    def _validate(cls, alpha, beta, length_penalty, coverage_penalty):
+        # these warnings indicate that either the alpha/beta
+        # forces a penalty to be a no-op, or a penalty is a no-op but
+        # the alpha/beta would suggest otherwise.
+        if length_penalty is None or length_penalty == "none":
+            if alpha != 0:
+                warnings.warn("Non-default `alpha` with no length penalty. "
+                              "`alpha` has no effect.")
+        else:
+            # using some length penalty
+            if length_penalty == "wu" and alpha == 0.:
+                warnings.warn("Using length penalty Wu with alpha==0 "
+                              "is equivalent to using length penalty none.")
+        if coverage_penalty is None or coverage_penalty == "none":
+            if beta != 0:
+                warnings.warn("Non-default `beta` with no coverage penalty. "
+                              "`beta` has no effect.")
+        else:
+            # using some coverage penalty
+            if beta == 0.:
+                warnings.warn("Non-default coverage penalty with beta==0 "
+                              "is equivalent to using coverage penalty none.")
+
+#==================================================================
+# decode_strategy.py
+import torch
+
+
+class DecodeStrategy(object):
+    """Base class for generation strategies.
+
+    Args:
+        pad (int): Magic integer in output vocab.
+        bos (int): Magic integer in output vocab.
+        eos (int): Magic integer in output vocab.
+        batch_size (int): Current batch size.
+        parallel_paths (int): Decoding strategies like beam search
+            use parallel paths. Each batch is repeated ``parallel_paths``
+            times in relevant state tensors.
+        min_length (int): Shortest acceptable generation, not counting
+            begin-of-sentence or end-of-sentence.
+        max_length (int): Longest acceptable sequence, not counting
+            begin-of-sentence (presumably there has been no EOS
+            yet if max_length is used as a cutoff).
+        block_ngram_repeat (int): Block beams where
+            ``block_ngram_repeat``-grams repeat.
+        exclusion_tokens (set[int]): If a gram contains any of these
+            tokens, it may repeat.
+        return_attention (bool): Whether to work with attention too. If this
+            is true, it is assumed that the decoder is attentional.
+
+    Attributes:
+        pad (int): See above.
+        bos (int): See above.
+        eos (int): See above.
+        predictions (list[list[LongTensor]]): For each batch, holds a
+            list of beam prediction sequences.
+        scores (list[list[FloatTensor]]): For each batch, holds a
+            list of scores.
+        attention (list[list[FloatTensor or list[]]]): For each
+            batch, holds a list of attention sequence tensors
+            (or empty lists) having shape ``(step, inp_seq_len)`` where
+            ``inp_seq_len`` is the length of the sample (not the max
+            length of all inp seqs).
+        alive_seq (LongTensor): Shape ``(B x parallel_paths, step)``.
+            This sequence grows in the ``step`` axis on each call to
+            :func:`advance()`.
+        is_finished (ByteTensor or NoneType): Shape
+            ``(B, parallel_paths)``. Initialized to ``None``.
+        alive_attn (FloatTensor or NoneType): If tensor, shape is
+            ``(step, B x parallel_paths, inp_seq_len)``, where ``inp_seq_len``
+            is the (max) length of the input sequence.
+        min_length (int): See above.
+        max_length (int): See above.
+        block_ngram_repeat (int): See above.
+        exclusion_tokens (set[int]): See above.
+        return_attention (bool): See above.
+        done (bool): See above.
+    """
+
+    def __init__(self, pad, bos, eos, batch_size, parallel_paths,
+                 min_length, block_ngram_repeat, exclusion_tokens,
+                 return_attention, max_length):
+
+        # magic indices
+        self.pad = pad
+        self.bos = bos
+        self.eos = eos
+
+        self.batch_size = batch_size
+        self.parallel_paths = parallel_paths
+        # result caching
+        self.predictions = [[] for _ in range(batch_size)]
+        self.predictions_idx = [[] for _ in range(batch_size)]
+        self.scores = [[] for _ in range(batch_size)]
+        self.scores_tgt = [[] for _ in range(batch_size)]
+        self.attention = [[] for _ in range(batch_size)]
+
+        self.alive_attn = None
+
+        self.min_length = min_length
+        self.max_length = max_length
+
+        self.block_ngram_repeat = block_ngram_repeat
+        n_paths = batch_size * parallel_paths
+        self.forbidden_tokens = [dict() for _ in range(n_paths)]
+
+        self.exclusion_tokens = exclusion_tokens
+        self.return_attention = return_attention
+
+        self.done = False
+
+    def initialize(self, memory_bank, src_lengths, src_map=None, device=None, 
+                   initial_token=None):
+        """DecodeStrategy subclasses should override :func:`initialize()`.
+
+        `initialize` should be called before all actions.
+        used to prepare necessary ingredients for decode.
+        """
+        if device is None:
+            device = torch.device('cpu')
+        initial_token = initial_token or self.bos
+        self.alive_seq = torch.full(
+            [self.batch_size * self.parallel_paths, 1], initial_token,
+            dtype=torch.long, device=device)
+        self.alive_idx_seq = torch.full(
+            [self.batch_size * self.parallel_paths, 1], 0,
+            dtype=torch.long, device=device)
+        self.is_finished = torch.zeros(
+            [self.batch_size, self.parallel_paths],
+            dtype=torch.uint8, device=device)
+        return None, memory_bank, src_lengths, src_map
+
+    def __len__(self):
+        return self.alive_seq.shape[1]
+
+    def ensure_min_length(self, log_probs):
+        if len(self) <= self.min_length:
+            log_probs[:, self.eos] = -1e20
+
+    def ensure_max_length(self):
+        # add one to account for BOS. Don't account for EOS because hitting
+        # this implies it hasn't been found.
+        if len(self) == self.max_length + 1:
+            self.is_finished.fill_(1)
+
+    def block_ngram_repeats(self, log_probs):
+        """
+        We prevent the beam from going in any direction that would repeat any
+        ngram of size <block_ngram_repeat> more thant once.
+
+        The way we do it: we maintain a list of all ngrams of size
+        <block_ngram_repeat> that is updated each time the beam advances, and
+        manually put any token that would lead to a repeated ngram to 0.
+
+        This improves on the previous version's complexity:
+           - previous version's complexity: batch_size * beam_size * len(self)
+           - current version's complexity: batch_size * beam_size
+
+        This improves on the previous version's accuracy;
+           - Previous version blocks the whole beam, whereas here we only
+            block specific tokens.
+           - Before the translation would fail when all beams contained
+            repeated ngrams. This is sure to never happen here.
+        """
+
+        # we don't block nothing if the user doesn't want it
+        if self.block_ngram_repeat <= 0:
+            return
+
+        # we can't block nothing beam's too short
+        if len(self) < self.block_ngram_repeat:
+            return
+
+        n = self.block_ngram_repeat - 1
+        for path_idx in range(self.alive_seq.shape[0]):
+            # we check paths one by one
+
+            current_ngram = tuple(self.alive_seq[path_idx, -n:].tolist())
+            forbidden_tokens = self.forbidden_tokens[path_idx].get(
+                current_ngram, None)
+            if forbidden_tokens is not None:
+                log_probs[path_idx, list(forbidden_tokens)] = -10e20
+
+    def maybe_update_forbidden_tokens(self):
+        """We complete and reorder the list of forbidden_tokens"""
+
+        # we don't forbid nothing if the user doesn't want it
+        if self.block_ngram_repeat <= 0:
+            return
+
+        # we can't forbid nothing if beam's too short
+        if len(self) < self.block_ngram_repeat:
+            return
+
+        n = self.block_ngram_repeat
+
+        forbidden_tokens = list()
+        for path_idx, seq in zip(self.select_indices, self.alive_seq):
+
+            # Reordering forbidden_tokens following beam selection
+            # We rebuild a dict to ensure we get the value and not the pointer
+            forbidden_tokens.append(
+                dict(self.forbidden_tokens[path_idx]))
+
+            # Grabing the newly selected tokens and associated ngram
+            current_ngram = tuple(seq[-n:].tolist())
+
+            # skip the blocking if any token in current_ngram is excluded
+            if set(current_ngram) & self.exclusion_tokens:
+                continue
+
+            forbidden_tokens[-1].setdefault(current_ngram[:-1], set())
+            forbidden_tokens[-1][current_ngram[:-1]].add(current_ngram[-1])
+
+        self.forbidden_tokens = forbidden_tokens
+
+    def advance(self, log_probs, attn):
+        """DecodeStrategy subclasses should override :func:`advance()`.
+
+        Advance is used to update ``self.alive_seq``, ``self.is_finished``,
+        and, when appropriate, ``self.alive_attn``.
+        """
+
+        raise NotImplementedError()
+
+    def update_finished(self):
+        """DecodeStrategy subclasses should override :func:`update_finished()`.
+
+        ``update_finished`` is used to update ``self.predictions``,
+        ``self.scores``, and other "output" attributes.
+        """
+
+        raise NotImplementedError()
+
+#==================================================================
+# translator.py
+#!/usr/bin/env python
+""" Translator Class and builder """
+from __future__ import print_function
+import codecs
+import os
+import time
+from tqdm import tqdm
+import numpy as np
+from itertools import count, zip_longest
+
+import torch
+import torch.nn.functional as F
+
+import onmt.model_builder
+import onmt.inputters as inputters
+import onmt.decoders.ensemble
+from onmt.translate.beam_search import BeamSearch
+from onmt.translate.greedy_search import GreedySearch
+from onmt.utils.misc import tile, set_random_seed, report_matrix
+from onmt.utils.alignment import extract_alignment, build_align_pharaoh
+from onmt.modules.copy_generator import collapse_copy_scores
+
+
+def build_translator(opt, report_score=True, logger=None, out_file=None, 
+                     log_score=False):
+    out_file = None
+    # if out_file is None:
+    #     out_file = codecs.open(opt.output, 'w+', 'utf-8')
+
+    load_test_model = onmt.decoders.ensemble.load_test_model \
+        if len(opt.models) > 1 else onmt.model_builder.load_test_model
+    fields, model, model_opt = load_test_model(opt)
+
+    scorer = onmt.translate.GNMTGlobalScorer.from_opt(opt)
+
+    translator = Translator.from_opt(
+        model,
+        fields,
+        opt,
+        model_opt,
+        global_scorer=scorer,
+        out_file=out_file,
+        report_align=opt.report_align,
+        report_score=report_score,
+        logger=logger,
+        log_score=log_score
+    )
+    return translator
+
+
+def max_tok_len(new, count, sofar):
+    """
+    In token batching scheme, the number of sequences is limited
+    such that the total number of src/tgt tokens (including padding)
+    in a batch <= batch_size
+    """
+    # Maintains the longest src and tgt length in the current batch
+    global max_src_in_batch  # this is a hack
+    # Reset current longest length at a new batch (count=1)
+    if count == 1:
+        max_src_in_batch = 0
+        # max_tgt_in_batch = 0
+    # Src: [<bos> w1 ... wN <eos>]
+    max_src_in_batch = max(max_src_in_batch, len(new.src[0]) + 2)
+    # Tgt: [w1 ... wM <eos>]
+    src_elements = count * max_src_in_batch
+    return src_elements
+
+
+class Translator(object):
+    """Translate a batch of sentences with a saved model.
+
+    Args:
+        model (onmt.modules.NMTModel): NMT model to use for translation
+        fields (dict[str, torchtext.data.Field]): A dict
+            mapping each side to its list of name-Field pairs.
+        src_reader (onmt.inputters.DataReaderBase): Source reader.
+        tgt_reader (onmt.inputters.TextDataReader): Target reader.
+        gpu (int): GPU device. Set to negative for no GPU.
+        n_best (int): How many beams to wait for.
+        min_length (int): See
+            :class:`onmt.translate.decode_strategy.DecodeStrategy`.
+        max_length (int): See
+            :class:`onmt.translate.decode_strategy.DecodeStrategy`.
+        beam_size (int): Number of beams.
+        random_sampling_topk (int): See
+            :class:`onmt.translate.greedy_search.GreedySearch`.
+        random_sampling_temp (int): See
+            :class:`onmt.translate.greedy_search.GreedySearch`.
+        stepwise_penalty (bool): Whether coverage penalty is applied every step
+            or not.
+        dump_beam (bool): Debugging option.
+        block_ngram_repeat (int): See
+            :class:`onmt.translate.decode_strategy.DecodeStrategy`.
+        ignore_when_blocking (set or frozenset): See
+            :class:`onmt.translate.decode_strategy.DecodeStrategy`.
+        replace_unk (bool): Replace unknown token.
+        data_type (str): Source data type.
+        verbose (bool): Print/log every translation.
+        report_time (bool): Print/log total time/frequency.
+        copy_attn (bool): Use copy attention.
+        global_scorer (onmt.translate.GNMTGlobalScorer): Translation
+            scoring/reranking object.
+        out_file (TextIO or codecs.StreamReaderWriter): Output file.
+        report_score (bool) : Whether to report scores
+        logger (logging.Logger or NoneType): Logger.
+    """
+
+    def __init__(
+            self,
+            model,
+            fields,
+            src_reader,
+            tgt_reader,
+            idx_reader,
+            gpu=-1,
+            n_best=1,
+            min_length=0,
+            max_length=100,
+            ratio=0.,
+            beam_size=30,
+            random_sampling_topk=1,
+            random_sampling_temp=1,
+            stepwise_penalty=None,
+            dump_beam=False,
+            block_ngram_repeat=0,
+            ignore_when_blocking=frozenset(),
+            replace_unk=False,
+            phrase_table="",
+            data_type="text",
+            verbose=False,
+            report_time=False,
+            copy_attn=False,
+            global_scorer=None,
+            out_file=None,
+            report_align=False,
+            report_score=True,
+            logger=None,
+            log_score=False,
+            seed=-1):
+        self.expert_id = None
+        self.log_score = log_score
+
+        self.model = model
+        self.fields = fields
+        tgt_field = dict(self.fields)["tgt"].base_field
+        self._tgt_vocab = tgt_field.vocab
+        self._tgt_eos_idx = self._tgt_vocab.stoi[tgt_field.eos_token]
+        self._tgt_pad_idx = self._tgt_vocab.stoi[tgt_field.pad_token]
+        self._tgt_bos_idx = self._tgt_vocab.stoi[tgt_field.init_token]
+        self._tgt_unk_idx = self._tgt_vocab.stoi[tgt_field.unk_token]
+        self._tgt_vocab_len = len(self._tgt_vocab)
+        print([self._tgt_vocab.itos[i] for i in range(self._tgt_vocab_len)])
+
+        self._gpu = gpu
+        self._use_cuda = gpu > -1
+        self._dev = torch.device("cuda", self._gpu) \
+            if self._use_cuda else torch.device("cpu")
+
+        self.n_best = n_best
+        self.max_length = max_length
+
+        self.beam_size = beam_size
+        self.random_sampling_temp = random_sampling_temp
+        self.sample_from_topk = random_sampling_topk
+
+        self.min_length = min_length
+        self.ratio = ratio
+        self.stepwise_penalty = stepwise_penalty
+        self.dump_beam = dump_beam
+        self.block_ngram_repeat = block_ngram_repeat
+        self.ignore_when_blocking = ignore_when_blocking
+        self._exclusion_idxs = {
+            self._tgt_vocab.stoi[t] for t in self.ignore_when_blocking}
+        self.src_reader = src_reader
+        self.tgt_reader = tgt_reader
+        self.idx_reader = idx_reader
+        self.replace_unk = replace_unk
+        if (self.replace_unk and 
+            not self.model.decoder.attentional):
+            raise ValueError(
+                "replace_unk requires an attentional decoder.")
+        self.phrase_table = phrase_table
+        self.data_type = data_type
+        self.verbose = verbose
+        self.report_time = report_time
+
+        self.copy_attn = copy_attn
+
+        self.global_scorer = global_scorer
+        if self.global_scorer.has_cov_pen and \
+                not self.model.decoder.attentional:
+            raise ValueError(
+                "Coverage penalty requires an attentional decoder.")
+        self.out_file = out_file
+        self.report_align = report_align
+        self.report_score = report_score
+        self.logger = logger
+
+        self.use_filter_pred = False
+        self._filter_pred = None
+
+        # for debugging
+        self.beam_trace = self.dump_beam != ""
+        self.beam_accum = None
+        if self.beam_trace:
+            self.beam_accum = {
+                "predicted_ids": [],
+                "beam_parent_ids": [],
+                "scores": [],
+                "log_probs": []}
+
+        set_random_seed(seed, self._use_cuda)
+
+    @classmethod
+    def from_opt(
+            cls,
+            model,
+            fields,
+            opt,
+            model_opt,
+            global_scorer=None,
+            out_file=None,
+            report_align=False,
+            report_score=True,
+            logger=None,
+            log_score=False):
+        """Alternate constructor.
+
+        Args:
+            model (onmt.modules.NMTModel): See :func:`__init__()`.
+            fields (dict[str, torchtext.data.Field]): See
+                :func:`__init__()`.
+            opt (argparse.Namespace): Command line options
+            model_opt (argparse.Namespace): Command line options saved with
+                the model checkpoint.
+            global_scorer (onmt.translate.GNMTGlobalScorer): See
+                :func:`__init__()`..
+            out_file (TextIO or codecs.StreamReaderWriter): See
+                :func:`__init__()`.
+            report_align (bool) : See :func:`__init__()`.
+            report_score (bool) : See :func:`__init__()`.
+            logger (logging.Logger or NoneType): See :func:`__init__()`.
+        """
+
+        src_reader = inputters.str2reader["text"].from_opt(opt)
+        tgt_reader = inputters.str2reader["text"].from_opt(opt)
+        idx_reader = inputters.str2reader["vec"].from_opt(opt)
+        return cls(
+            model,
+            fields,
+            src_reader,
+            tgt_reader,
+            idx_reader,
+            gpu=opt.gpu,
+            n_best=opt.n_best,
+            min_length=opt.min_length,
+            max_length=opt.max_length,
+            ratio=opt.ratio,
+            beam_size=opt.beam_size,
+            random_sampling_topk=opt.random_sampling_topk,
+            random_sampling_temp=opt.random_sampling_temp,
+            stepwise_penalty=opt.stepwise_penalty,
+            dump_beam=opt.dump_beam,
+            block_ngram_repeat=opt.block_ngram_repeat,
+            ignore_when_blocking=set(opt.ignore_when_blocking),
+            replace_unk=opt.replace_unk,
+            phrase_table=opt.phrase_table,
+            data_type=opt.data_type,
+            verbose=opt.verbose,
+            report_time=opt.report_time,
+            copy_attn=model_opt.copy_attn,
+            global_scorer=global_scorer,
+            out_file=out_file,
+            report_align=report_align,
+            report_score=report_score,
+            logger=logger,
+            seed=opt.seed,
+            log_score=log_score)
+
+    def _log(self, msg):
+        if self.logger:
+            self.logger.info(msg)
+        else:
+            print(msg)
+
+    def _gold_score(self, batch, memory_bank, src_lengths, src_vocabs,
+                    use_src_map, enc_states, batch_size, src, initial_token):
+        if "tgt" in batch.__dict__:
+            gs = self._score_target(
+                batch, memory_bank, src_lengths, src_vocabs,
+                batch.src_map if use_src_map else None, initial_token)
+            self.model.decoder.init_state(src, memory_bank, enc_states)
+        else:
+            gs = [0] * batch_size
+        return gs
+
+    def translate(
+            self,
+            src,
+            tgt=None,
+            idx=None,
+            src_dir=None,
+            batch_size=None,
+            batch_type="sents",
+            attn_debug=False,
+            align_debug=False,
+            phrase_table="",
+            only_gold_score=False):
+        """Translate content of ``src`` and get gold scores from ``tgt``.
+
+        Args:
+            src: See :func:`self.src_reader.read()`.
+            tgt: See :func:`self.tgt_reader.read()`.
+            src_dir: See :func:`self.src_reader.read()` (only relevant
+                for certain types of data).
+            batch_size (int): size of examples per mini-batch
+            attn_debug (bool): enables the attention logging
+            align_debug (bool): enables the word alignment logging
+
+        Returns:
+            (`list`, `list`)
+
+            * all_scores is a list of `batch_size` lists of `n_best` scores
+            * all_predictions is a list of `batch_size` lists
+                of `n_best` predictions
+        """
+        if batch_size is None:
+            raise ValueError("batch_size must be set")
+
+        src_data = {"reader": self.src_reader, "data": src, "dir": None}
+        tgt_data = {"reader": self.tgt_reader, "data": tgt, "dir": None}
+        idx_data = {"reader": self.idx_reader, "data": idx, "dir": None}
+        _readers, _data, _dir = inputters.Dataset.config(
+            [('src', src_data), ('tgt', tgt_data), ('idx', idx_data)])
+
+        # corpus_id field is useless here
+        if self.fields.get("corpus_id", None) is not None:
+            self.fields.pop('corpus_id')
+        data = inputters.Dataset(
+            self.fields, readers=_readers, data=_data, dirs=_dir,
+            sort_key=inputters.str2sortkey[self.data_type],
+            filter_pred=self._filter_pred
+        )
+
+        data_iter = inputters.OrderedIterator(
+            dataset=data,
+            device=self._dev,
+            batch_size=batch_size,
+            batch_size_fn=max_tok_len if batch_type == "tokens" else None,
+            train=False,
+            sort=False,
+            sort_within_batch=True,
+            shuffle=False
+        )
+
+        xlation_builder = onmt.translate.TranslationBuilder(
+            data, self.fields, self.n_best, self.replace_unk, tgt,
+            self.phrase_table
+        )
+
+        # Statistics
+        counter = count(1)
+        pred_score_total, pred_words_total = 0, 0
+        gold_score_total, gold_words_total = 0, 0
+
+        all_scores = []
+        all_gold_scores = []
+        all_predictions = []
+
+        start_time = time.time()
+
+        for batch in tqdm(data_iter):
+            batch_data = self.translate_batch(
+                batch, data.src_vocabs, attn_debug, only_gold_score
+            )
+            translations = xlation_builder.from_batch(batch_data)
+
+            for trans in translations:
+                n_best_scores = trans.pred_scores[:self.n_best]
+                all_scores += [n_best_scores]
+                pred_score_total += trans.pred_scores[0]
+                pred_words_total += len(trans.pred_sents[0])
+                if tgt is not None:
+                    n_best_gold_scores = [trans.gold_score]
+                    all_gold_scores += [n_best_gold_scores]
+                    gold_score_total += trans.gold_score
+                    gold_words_total += len(trans.gold_sent) + 1
+
+                n_best_preds = [" ".join(pred)
+                                for pred in trans.pred_sents[:self.n_best]]
+                if self.report_align:
+                    align_pharaohs = [build_align_pharaoh(align) for align
+                                      in trans.word_aligns[:self.n_best]]
+                    n_best_preds_align = [" ".join(align) for align
+                                          in align_pharaohs]
+                    n_best_preds = [pred + " ||| " + align
+                                    for pred, align in zip(
+                                        n_best_preds, n_best_preds_align)]
+                all_predictions += [n_best_preds]
+                if self.out_file:
+                    if self.log_score:
+                        # in BWD translation(tgt=product, n_best==1),
+                        # we use gold score
+                        if self.n_best == 1 and tgt is not None:
+                            n_best_scores = n_best_gold_scores
+                        n_best_preds_scores = [
+                            pred + ',' + str(score.item()) for pred, score in 
+                            zip(n_best_preds, n_best_scores)]
+                        self.out_file.write(
+                            '\n'.join(n_best_preds_scores) + '\n')
+                        self.out_file.flush()
+                    else:
+                        self.out_file.write('\n'.join(n_best_preds) + '\n')
+                        self.out_file.flush()
+
+                if self.verbose:
+                    sent_number = next(counter)
+                    output = trans.log(sent_number)
+                    if self.logger:
+                        self.logger.info(output)
+                    else:
+                        os.write(1, output.encode('utf-8'))
+
+                if attn_debug:
+                    preds = trans.pred_sents[0]
+                    preds.append('</s>')
+                    attns = trans.attns[0].tolist()
+                    if self.data_type == 'text':
+                        srcs = trans.src_raw
+                    else:
+                        srcs = [str(item) for item in range(len(attns[0]))]
+                    output = report_matrix(srcs, preds, attns)
+                    if self.logger:
+                        self.logger.info(output)
+                    else:
+                        os.write(1, output.encode('utf-8'))
+
+                if align_debug:
+                    if trans.gold_sent is not None:
+                        tgts = trans.gold_sent
+                    else:
+                        tgts = trans.pred_sents[0]
+                    align = trans.word_aligns[0].tolist()
+                    if self.data_type == 'text':
+                        srcs = trans.src_raw
+                    else:
+                        srcs = [str(item) for item in range(len(align[0]))]
+                    output = report_matrix(srcs, tgts, align)
+                    if self.logger:
+                        self.logger.info(output)
+                    else:
+                        os.write(1, output.encode('utf-8'))
+
+        end_time = time.time()
+
+        if self.report_score:
+            msg = self._report_score('PRED', pred_score_total,
+                                     pred_words_total)
+            self._log(msg)
+            if tgt is not None:
+                msg = self._report_score('GOLD', gold_score_total,
+                                         gold_words_total)
+                self._log(msg)
+
+        if self.report_time:
+            total_time = end_time - start_time
+            self._log("Total translation time (s): %f" % total_time)
+            self._log("Average translation time (s): %f" % (
+                total_time / len(all_predictions)))
+            self._log("Tokens per second: %f" % (
+                pred_words_total / total_time))
+
+        if self.dump_beam:
+            import json
+            json.dump(self.translator.beam_accum,
+                      codecs.open(self.dump_beam, 'w', 'utf-8'))
+        if tgt is not None and self.n_best == 1:
+            return all_gold_scores, all_predictions
+        else:
+            return all_scores, all_predictions
+
+    def attention_analysis(
+            self,
+            src,
+            tgt,
+            batch_type="sents",
+            phrase_table=""):
+        """Translate content of ``src`` and get gold scores from ``tgt``.
+
+        Args:
+            src: See :func:`self.src_reader.read()`.
+            tgt: See :func:`self.tgt_reader.read()`.
+            src_dir: See :func:`self.src_reader.read()` (only relevant
+                for certain types of data).
+            batch_size (int): size of examples per mini-batch
+            attn_debug (bool): enables the attention logging
+            align_debug (bool): enables the word alignment logging
+
+        Returns:
+            (`list`, `list`)
+
+            * all_scores is a list of `batch_size` lists of `n_best` scores
+            * all_predictions is a list of `batch_size` lists
+                of `n_best` predictions
+        """
+        batch_size = len(src)
+
+        src_data = {"reader": self.src_reader, "data": src, "dir": None}
+        tgt_data = {"reader": self.tgt_reader, "data": tgt, "dir": None}
+        _readers, _data, _dir = inputters.Dataset.config(
+            [('src', src_data), ('tgt', tgt_data)])
+
+        # corpus_id field is useless here
+        if self.fields.get("corpus_id", None) is not None:
+            self.fields.pop('corpus_id')
+        data = inputters.Dataset(
+            self.fields, readers=_readers, data=_data, dirs=_dir,
+            sort_key=inputters.str2sortkey[self.data_type],
+            filter_pred=self._filter_pred
+        )
+
+        data_iter = inputters.OrderedIterator(
+            dataset=data,
+            device=self._dev,
+            batch_size=batch_size,
+            batch_size_fn=max_tok_len if batch_type == "tokens" else None,
+            train=False,
+            sort=False,
+            sort_within_batch=True,
+            shuffle=False
+        )
+
+        xlation_builder = onmt.translate.TranslationBuilder(
+            data, self.fields, self.n_best, self.replace_unk, tgt,
+            self.phrase_table
+        )
+
+        # Statistics
+        counter = count(1)
+        pred_score_total, pred_words_total = 0, 0
+        gold_score_total, gold_words_total = 0, 0
+
+        all_scores = []
+        all_gold_scores = []
+        all_predictions = []
+        all_attentions = []
+
+        start_time = time.time()
+
+        for batch in tqdm(data_iter):
+            batch_data = self.translate_batch(
+                batch, data.src_vocabs, attn_debug=True, only_gold_score=False)
+            translations = xlation_builder.from_batch(batch_data)
+
+            for trans in translations:
+                n_best_scores = trans.pred_scores[:self.n_best]
+                all_scores += [n_best_scores]
+                pred_score_total += trans.pred_scores[0]
+                pred_words_total += len(trans.pred_sents[0])
+                
+                n_best_gold_scores = [trans.gold_score]
+                all_gold_scores += [n_best_gold_scores]
+                gold_score_total += trans.gold_score
+                gold_words_total += len(trans.gold_sent) + 1
+
+                n_best_preds = [" ".join(pred)
+                                for pred in trans.pred_sents[:self.n_best]]
+                if self.report_align:
+                    align_pharaohs = [build_align_pharaoh(align) for align
+                                      in trans.word_aligns[:self.n_best]]
+                    n_best_preds_align = [" ".join(align) for align
+                                          in align_pharaohs]
+                    n_best_preds = [pred + " ||| " + align
+                                    for pred, align in zip(
+                                        n_best_preds, n_best_preds_align)]
+                all_predictions += [n_best_preds]
+                if self.out_file:
+                    if self.log_score:
+                        # in BWD translation(tgt=product, n_best==1),
+                        # we use gold score
+                        if self.n_best == 1 and tgt is not None:
+                            n_best_scores = n_best_gold_scores
+                        n_best_preds_scores = [
+                            pred + ',' + str(score.item()) for pred, score in 
+                            zip(n_best_preds, n_best_scores)]
+                        self.out_file.write(
+                            '\n'.join(n_best_preds_scores) + '\n')
+                        self.out_file.flush()
+                    else:
+                        self.out_file.write('\n'.join(n_best_preds) + '\n')
+                        self.out_file.flush()
+
+                if self.verbose:
+                    sent_number = next(counter)
+                    output = trans.log(sent_number)
+                    os.write(1, output.encode('utf-8'))
+
+                for i in range(self.beam_size):
+                    preds = trans.pred_sents[i]
+                    preds.append('</s>')
+                    attns = trans.attns[i].tolist()
+                    srcs = trans.src_raw
+                    print(srcs, len(srcs), len(attns), len(attns[0]))
+                    output = report_matrix(srcs, preds, attns)
+                    os.write(1, output.encode('utf-8'))
+                    all_attentions.append(trans.attns[i].cpu().numpy())
+
+        end_time = time.time()
+
+        if self.report_score:
+            msg = self._report_score('GOLD', gold_score_total,
+                                        gold_words_total)
+            self._log(msg)
+
+        if self.report_time:
+            total_time = end_time - start_time
+            self._log("Total translation time (s): %f" % total_time)
+            self._log("Average translation time (s): %f" % (
+                total_time / len(all_predictions)))
+            self._log("Tokens per second: %f" % (
+                pred_words_total / total_time))
+        
+        return all_scores, all_predictions, all_attentions
+
+    def _align_pad_prediction(self, predictions, bos, pad):
+        """
+        Padding predictions in batch and add BOS.
+
+        Args:
+            predictions (List[List[Tensor]]): `(batch, n_best,)`, for each src
+                sequence contain n_best tgt predictions all of which ended with
+                eos id.
+            bos (int): bos index to be used.
+            pad (int): pad index to be used.
+
+        Return:
+            batched_nbest_predict (torch.LongTensor): `(batch, n_best, tgt_l)`
+        """
+        dtype, device = predictions[0][0].dtype, predictions[0][0].device
+        flatten_tgt = [best.tolist() for bests in predictions
+                       for best in bests]
+        paded_tgt = torch.tensor(
+            list(zip_longest(*flatten_tgt, fillvalue=pad)),
+            dtype=dtype, device=device).T
+        bos_tensor = torch.full([paded_tgt.size(0), 1], bos,
+                                dtype=dtype, device=device)
+        full_tgt = torch.cat((bos_tensor, paded_tgt), dim=-1)
+        batched_nbest_predict = full_tgt.view(
+            len(predictions), -1, full_tgt.size(-1))  # (batch, n_best, tgt_l)
+        return batched_nbest_predict
+
+    def _align_forward(self, batch, predictions):
+        """
+        For a batch of input and its prediction, return a list of batch predict
+        alignment src indice Tensor in size ``(batch, n_best,)``.
+        """
+        # (0) add BOS and padding to tgt prediction
+        if hasattr(batch, 'tgt'):
+            batch_tgt_idxs = batch.tgt[0].transpose(1, 2).transpose(0, 2)
+        else:
+            batch_tgt_idxs = self._align_pad_prediction(
+                predictions, bos=self._tgt_bos_idx, pad=self._tgt_pad_idx)
+        tgt_mask = (batch_tgt_idxs.eq(self._tgt_pad_idx) |
+                    batch_tgt_idxs.eq(self._tgt_eos_idx) |
+                    batch_tgt_idxs.eq(self._tgt_bos_idx))
+
+        n_best = batch_tgt_idxs.size(1)
+        # (1) Encoder forward.
+        src, enc_states, memory_bank, src_lengths = self._run_encoder(batch)
+
+        # (2) Repeat src objects `n_best` times.
+        # We use batch_size x n_best, get ``(src_len, batch * n_best, nfeat)``
+        src = tile(src, n_best, dim=1)
+        enc_states = tile(enc_states, n_best, dim=1)
+        if isinstance(memory_bank, tuple):
+            memory_bank = tuple(tile(x, n_best, dim=1) for x in memory_bank)
+        else:
+            memory_bank = tile(memory_bank, n_best, dim=1)
+        src_lengths = tile(src_lengths, n_best)  # ``(batch * n_best,)``
+
+        # (3) Init decoder with n_best src,
+        self.model.decoder.init_state(src, memory_bank, enc_states)
+        # reshape tgt to ``(len, batch * n_best, nfeat)``
+        tgt = batch_tgt_idxs.view(-1, batch_tgt_idxs.size(-1)).T.unsqueeze(-1)
+        dec_in = tgt[:-1]  # exclude last target from inputs
+        _, _, attns = self.model.decoder(
+            dec_in, memory_bank, memory_lengths=src_lengths, with_align=True)
+
+        alignment_attn = attns["align"]  # ``(B, tgt_len-1, src_len)``
+        # masked_select
+        align_tgt_mask = tgt_mask.view(-1, tgt_mask.size(-1))
+        prediction_mask = align_tgt_mask[:, 1:]  # exclude bos to match pred
+        # get aligned src id for each prediction's valid tgt tokens
+        alignement = extract_alignment(
+            alignment_attn, prediction_mask, src_lengths, n_best)
+        return alignement
+
+    def translate_batch(self, batch, src_vocabs, attn_debug, only_gold_score):
+        """Translate a batch of sentences."""
+        with torch.no_grad():
+            if self.beam_size == 1:
+                decode_strategy = GreedySearch(
+                    pad=self._tgt_pad_idx,
+                    bos=self._tgt_bos_idx,
+                    eos=self._tgt_eos_idx,
+                    batch_size=batch.batch_size,
+                    min_length=self.min_length, max_length=self.max_length,
+                    block_ngram_repeat=self.block_ngram_repeat,
+                    exclusion_tokens=self._exclusion_idxs,
+                    return_attention=attn_debug or self.replace_unk,
+                    sampling_temp=self.random_sampling_temp,
+                    keep_topk=self.sample_from_topk)
+            else:
+                # TODO: support these blacklisted features
+                assert not self.dump_beam
+                decode_strategy = BeamSearch(
+                    self.beam_size,
+                    batch_size=batch.batch_size,
+                    pad=self._tgt_pad_idx,
+                    bos=self._tgt_bos_idx,
+                    eos=self._tgt_eos_idx,
+                    n_best=self.n_best,
+                    global_scorer=self.global_scorer,
+                    min_length=self.min_length, max_length=self.max_length,
+                    return_attention=attn_debug or self.replace_unk,
+                    block_ngram_repeat=self.block_ngram_repeat,
+                    exclusion_tokens=self._exclusion_idxs,
+                    stepwise_penalty=self.stepwise_penalty,
+                    ratio=self.ratio)
+            return self._translate_batch_with_strategy(
+                batch, src_vocabs, decode_strategy, only_gold_score)
+
+    def _run_encoder(self, batch, initial_token):
+        src, src_lengths = batch.src
+
+        enc_states, memory_bank, src_lengths = self.model.encoder(
+            src, src_lengths)
+        if src_lengths is None:
+            assert not isinstance(memory_bank, tuple), \
+                'Ensemble decoding only supported for text data'
+            src_lengths = torch.Tensor(batch.batch_size) \
+                               .type_as(memory_bank) \
+                               .long() \
+                               .fill_(memory_bank.size(0))
+        return src, enc_states, memory_bank, src_lengths
+
+    def _decode_and_generate(
+            self,
+            decoder_in,
+            idx_in,
+            memory_bank,
+            batch,
+            src_vocabs,
+            memory_lengths,
+            seen_mask,
+            tiled_src,
+            src_map=None,
+            step=None,
+            batch_offset=None):
+        if self.copy_attn:
+            # Turn any copied words into UNKs.
+            decoder_in = decoder_in.masked_fill(
+                decoder_in.gt(self._tgt_vocab_len - 1), self._tgt_unk_idx
+            )
+
+        # Decoder forward, takes [tgt_len, batch, nfeats] as input
+        # and [src_len, batch, hidden] as memory_bank
+        # in case of inference tgt_len = 1, batch = beam times batch_size
+        # in case of Gold Scoring tgt_len = actual length, batch = 1 batch
+        dec_state, dec_out, dec_attn = self.model.decoder(
+            decoder_in, idx_in, memory_bank, memory_lengths=memory_lengths, step=step
+        )
+        log_vocab_dist = self.model.generator(dec_out)    # (TL-1, B, V)
+
+        a_context = dec_attn['avg']        # (TL-1, B, SL)
+        attn_dist_logit = dec_attn['cop']           # (TL-1, B, SL)
+        h_star = torch.bmm(
+            a_context.transpose(0, 1),  # (B, TL-1, SL)
+            memory_bank.transpose(0, 1)   # (B, SL, model_dim)
+        ).transpose(0, 1)       # (TL-1, B, model_dim)
+        p_gen_input = torch.cat((h_star, dec_out, dec_state), 2)
+        p_gen = self.model.pgen(p_gen_input) # (TL-1, B, 1)
+
+        log_probs_gen = log_vocab_dist
+        log_probs_cop = F.log_softmax(attn_dist_logit, dim=-1)
+        
+        # Generator forward.
+        if "avg" in dec_attn:
+            attn = dec_attn["avg"]
+        else:
+            attn = None
+        p_gen = p_gen.squeeze(0)
+        log_probs_gen = log_probs_gen.squeeze(0)
+        log_probs_cop = log_probs_cop.squeeze(0)
+            # returns [(batch_size x beam_size) , vocab ] when 1 step
+            # or [ tgt_len, batch_size, vocab ] when full sentence
+
+        return p_gen, log_probs_gen, log_probs_cop, attn
+
+    def _translate_batch_with_strategy(
+            self,
+            batch,
+            src_vocabs,
+            decode_strategy,
+            only_gold_score):
+        """Translate a batch of sentences step by step using cache.
+
+        Args:
+            batch: a batch of sentences, yield by data iterator.
+            src_vocabs (list): list of torchtext.data.Vocab if can_copy.
+            decode_strategy (DecodeStrategy): A decode strategy to use for
+                generate translation step by step.
+
+        Returns:
+            results (dict): The translation results.
+        """
+        # (0) Prep the components of the search.
+        use_src_map = self.copy_attn
+        parallel_paths = decode_strategy.parallel_paths  # beam_size
+        batch_size = batch.batch_size
+
+        initial_encoding_token = None
+        initial_decoding_token = self._tgt_bos_idx
+
+        # (1) Run the encoder on the src.
+        src, enc_states, memory_bank, src_lengths = \
+            self._run_encoder(batch, initial_encoding_token)
+        self.model.decoder.init_state(src, memory_bank, enc_states)
+
+        results = {
+            "predictions": None,
+            "scores": None,
+            "attention": None,
+            "batch": batch,
+            "gold_score": self._gold_score(
+                batch, memory_bank, src_lengths, src_vocabs, use_src_map,
+                enc_states, batch_size, src, initial_decoding_token)}
+
+        if only_gold_score:
+            results["scores"] = [[x] for x in results["gold_score"]]
+            results["predictions"] = [[None] for _ in decode_strategy.predictions]
+            results["attention"] = [[None] for _ in range(batch_size)]
+            results["alignment"] = [[] for _ in range(batch_size)]
+        else:
+            # (2) prep decode_strategy. Possibly repeat src objects.
+            src_map = batch.src_map if use_src_map else None
+            fn_map_state, memory_bank, memory_lengths, src_map = \
+                decode_strategy.initialize(
+                    memory_bank, src, src_lengths, src_map,
+                    initial_token=initial_decoding_token)
+            if fn_map_state is not None:
+                self.model.decoder.map_state(fn_map_state)
+
+            # (3) Begin decoding step by step:
+            for step in range(decode_strategy.max_length):
+                decoder_input = decode_strategy.current_predictions.\
+                    view(1, -1, 1)
+                idx_input = decode_strategy.current_idx_predictions.\
+                    view(1, -1, 1)
+                seen_mask = decode_strategy.seen_mask
+                tiled_src = decode_strategy.tiled_src
+                p_gen, log_probs_gen, log_probs_cop, attn = self._decode_and_generate(
+                    decoder_input,
+                    idx_input,
+                    memory_bank,
+                    batch,
+                    src_vocabs,
+                    memory_lengths=memory_lengths,
+                    seen_mask=seen_mask,
+                    tiled_src=tiled_src,
+                    src_map=src_map,
+                    step=step,
+                    batch_offset=decode_strategy.batch_offset)
+                # print(src.shape, log_probs_gen.shape, log_probs_cop.shape, p_gen.shape)
+                # raise
+
+                decode_strategy.advance(p_gen, log_probs_gen, log_probs_cop, attn)
+                any_finished = decode_strategy.is_finished.any()
+                if any_finished:
+                    decode_strategy.update_finished()
+                    if decode_strategy.done:
+                        break
+
+                select_indices = decode_strategy.select_indices
+
+                if any_finished:
+                    # Reorder states.
+                    if isinstance(memory_bank, tuple):
+                        memory_bank = tuple(x.index_select(1, select_indices)
+                                            for x in memory_bank)
+                    else:
+                        memory_bank = memory_bank.index_select(1, select_indices)
+
+                    memory_lengths = memory_lengths.index_select(0, select_indices)
+
+                    if src_map is not None:
+                        src_map = src_map.index_select(1, select_indices)
+
+                if parallel_paths > 1 or any_finished:
+                    self.model.decoder.map_state(
+                        lambda state, dim: state.index_select(dim, select_indices))
+
+            results["scores"] = decode_strategy.scores
+            results["predictions"] = decode_strategy.predictions
+            results["attention"] = decode_strategy.attention
+            if self.report_align:
+                results["alignment"] = self._align_forward(
+                    batch, decode_strategy.predictions)
+            else:
+                results["alignment"] = [[] for _ in range(batch_size)]
+        return results
+
+    def _score_target(self, batch, memory_bank, src_lengths,
+                      src_vocabs, src_map, initial_token):
+        tgt = batch.tgt[0]
+        tgt_in = tgt[:-1]
+        tgt_in[0, :, 0] = initial_token
+
+        log_probs, attn = self._decode_and_generate(
+            tgt_in, memory_bank, batch, src_vocabs,
+            memory_lengths=src_lengths, src_map=src_map)
+
+        log_probs[:, :, self._tgt_pad_idx] = 0
+        gold = tgt[1:]
+        gold_scores = log_probs.gather(2, gold)
+        gold_scores = gold_scores.sum(dim=0).view(-1)
+
+        return gold_scores
+
+    def _report_score(self, name, score_total, words_total):
+        if words_total == 0:
+            msg = "%s No words predicted" % (name,)
+        else:
+            avg_score = score_total / words_total
+            ppl = np.exp(-score_total.item() / words_total)
+            msg = ("%s AVG SCORE: %.4f, %s PPL: %.4f" % (
+                name, avg_score,
+                name, ppl))
+        return msg
+
+#==================================================================
+#==================================================================
+#==================================================================
+#==================================================================
+#==================================================================
+#==================================================================
+#==================================================================
+#==================================================================
+#==================================================================
+#==================================================================
+#==================================================================
+
