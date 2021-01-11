@@ -1,0 +1,372 @@
+
+##############################################################################
+# utils
+##############################################################################
+
+
+import os
+import re
+import sys
+
+from rdkit import Chem
+
+
+def disable_rdkit_logging():
+    from rdkit import rdBase
+    rdBase.DisableLog('rdApp.error')
+    rdBase.DisableLog('rdApp.warning')
+    rdBase.DisableLog('rdApp.info')
+    rdBase.DisableLog('rdApp.debug')
+
+
+# Disable print
+def block_print():
+    sys.stdout = open(os.devnull, 'w')
+
+
+# Restore print
+def enable_print():
+    sys.stdout = sys.__stdout__
+
+
+def ensure_dir(directory):
+    """Makes dir if not existed."""
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+
+def smi_tokenizer(smi):
+    """
+    Tokenize a SMILES molecule or reaction
+    """
+    pattern = "(\[[^\]]+]|Br?|Cl?|Pt|N|O|S|P|F|I|b|c|n|o|s|p|\(|\)|\.|=|#|-|\+|\\\\|\/|:|~|@|\?|>|\*|\$|\%[0-9]{2}|[0-9])"
+    regex = re.compile(pattern)
+    tokens = [token for token in regex.findall(smi)]
+    assert smi == ''.join(tokens)
+    return ' '.join(tokens)
+
+
+def canonicalize(smiles):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is not None:
+        # isometricsmiles=True (default)
+        smiles = Chem.MolToSmiles(mol)
+    else:
+        smiles = ''
+    return smiles
+
+
+def canonicalize_smiles(smiles):
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+    except:
+        mol = None
+
+    if mol is None:
+        return ''
+    else:
+        return Chem.MolToSmiles(mol)
+
+    
+def match_smiles_set(source_set, target_set):
+    if len(source_set) != len(target_set):
+        return False
+
+    for smiles in target_set:
+        if smiles not in source_set:
+            return False
+    return True
+    
+
+def remove_space(line):
+    """
+    remove space from tokenized line
+    """
+    return ''.join(line.strip().split(' '))
+
+##############################################################################
+# tokenize_and_split_data_by_products
+# return: 
+##############################################################################
+
+
+import argparse
+import codecs
+import os
+import pickle
+from itertools import product
+
+import numpy as np
+from tqdm import tqdm
+
+from utils import ensure_dir, smi_tokenizer, canonicalize
+
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser(
+        description='tokenize_and_split_data.py',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('-rawdata-path', 
+                        type=str, 
+                        default=None,
+                        help='Rawdata path')
+    parser.add_argument('-output-dir', 
+                        type=str, 
+                        default='./data',
+                        help='directory to save the resulting dataset')
+    parser.add_argument('-seed', 
+                        type=int, 
+                        default=0,
+                        help='random seed for shuffling data')
+    parser.add_argument('-canonicalize', 
+                        action="store_true",
+                        help='canonicalize smiles or not')
+    parser.add_argument('-training-ratio', 
+                        type=float, 
+                        default=0.8,
+                        help='training data ratio')
+    parser.add_argument('-validation-ratio', 
+                        type=float, 
+                        default=0.1,
+                        help='validation data ratio')
+    parser.add_argument('-test-ratio', 
+                        type=float, 
+                        default=0.1,
+                        help='test data ratio')
+    
+    args = parser.parse_args()
+    assert args.rawdata_path is not None
+    assert args.training_ratio + args.validation_ratio + args.test_ratio == 1
+
+    # define target dir to save data
+    rawdata_fname = os.path.basename(args.rawdata_path)
+    ensure_dir(args.output_dir)
+    
+    # DIY: load data <-- (pickle, txt, ...)
+    ############################################
+#     with open(args.rawdata_path, 'rb') as f:
+#         reactions = pickle.load(f)
+    with open(args.rawdata_path, 'r') as f:
+        reactions = f.readlines()
+    ############################################
+
+    # group reactions by product
+    rcts_by_prd = dict()
+    for reaction in reactions:
+        rct, prd = reaction.strip().split('>>')
+        if args.canonicalize:
+            prd = canonicalize(prd)
+            rct = '.'.join([canonicalize_smiles(s) 
+                            for s in rct.split('.')])
+        if prd not in rcts_by_prd.keys():
+            rcts_by_prd[prd] = [rct]
+        else:
+            rcts_by_prd[prd] += [rct]
+
+    product_list = list(rcts_by_prd.keys())
+    print('reactions:', len(reactions))
+    print('num_product:', len(product_list))
+    
+    # shuffle
+    np.random.seed(args.seed)
+    np.random.shuffle(product_list)
+
+    # dataset split size
+    n_product = len(product_list)
+    n_trn = int(n_product * args.training_ratio)
+    n_val = int(n_product * args.validation_ratio)
+    print('n_product per split:', n_trn, n_val, n_product-n_trn-n_val)
+
+    def get_product_reactants_lines(product_list):
+        prd_rct_pairs = []
+        for prd in tqdm(product_list):
+            rcts_of_prd = rcts_by_prd[prd]
+            # tokenize
+            prd = smi_tokenizer(prd) + '\n'
+            rcts_of_prd = [smi_tokenizer(rct) + '\n'
+                            for rct in rcts_of_prd]
+            prd_rct_pairs += list(product([prd], rcts_of_prd))
+        product_lines, reactant_lines = list(zip(*prd_rct_pairs))
+        return product_lines, reactant_lines
+
+    # save
+    os.chdir(args.output_dir)
+
+    product_lines, reactants_lines = \
+        get_product_reactants_lines(product_list[:n_trn])
+    print('n_trn_data:', len(reactants_lines))
+    with codecs.open('src-train.txt', 'w', encoding='utf-8') as f:
+        f.writelines(product_lines)
+    with codecs.open('tgt-train.txt', 'w', encoding='utf-8') as f:
+        f.writelines(reactants_lines)
+
+    product_lines, reactants_lines = \
+        get_product_reactants_lines(product_list[n_trn:n_trn+n_val])
+    print('n_val_data:', len(reactants_lines))
+    with codecs.open('src-val.txt', 'w', encoding='utf-8') as f:
+        f.writelines(product_lines)
+    with codecs.open('tgt-val.txt', 'w', encoding='utf-8') as f:
+        f.writelines(reactants_lines)
+
+    product_lines, reactants_lines = \
+        get_product_reactants_lines(product_list[n_trn+n_val:])
+    print('n_tst_data:', len(reactants_lines))
+    with codecs.open('src-test.txt', 'w', encoding='utf-8') as f:
+        f.writelines(product_lines)
+    with codecs.open('tgt-test.txt', 'w', encoding='utf-8') as f:
+        f.writelines(reactants_lines)
+
+
+##############################################################################
+# get changeed bond/atoms from rxn: prd ==> rct
+# return: changes_bond_and_atoms
+##############################################################################
+
+import rdkit.Chem as Chem
+import numpy as np
+from tqdm import tqdm
+
+'''
+This script prepares the data used in Wengong Jin's NIPS paper on predicting reaction outcomes for the modified
+forward prediction script. Rather than just training to predict which bonds change, we make a direct prediction
+on HOW those bonds change
+'''
+
+def get_changed_bonds(from_smi, to_smi):
+    from_mol = Chem.MolFromSmiles(from_smi)
+    to_mol = Chem.MolFromSmiles(to_smi)
+
+    conserved_maps = [a.GetProp('molAtomMapNumber') for a in from_mol.GetAtoms() 
+                      if a.HasProp('molAtomMapNumber')]
+    bond_changes = set() # keep track of atom/bond changes
+    atom_changes = set()
+    
+    # Look at changed bonds
+    bonds_prev = {}
+    atoms_prev = {}
+    for bond in from_mol.GetBonds():
+        ba, ea = bond.GetBeginAtom(), bond.GetEndAtom()
+        ba_num = ba.GetProp('molAtomMapNumber') if ba.HasProp('molAtomMapNumber') else '0'
+        ea_num = ea.GetProp('molAtomMapNumber') if ea.HasProp('molAtomMapNumber') else '0'
+        if (ba_num not in conserved_maps) and (ea_num not in conserved_maps): continue
+        nums = sorted([ba_num, ea_num])
+        bonds_prev['{}~{}'.format(nums[0], nums[1])] = bond.GetBondTypeAsDouble()
+    for atom in from_mol.GetAtoms():
+        a_num = atom.GetProp('molAtomMapNumber') if atom.HasProp('molAtomMapNumber') else '0'
+        if a_num not in conserved_maps: continue
+        atoms_prev[a_num] = atom.GetTotalNumHs()
+    bonds_new = {}
+    atoms_new = {}
+    for bond in to_mol.GetBonds():
+        ba, ea = bond.GetBeginAtom(), bond.GetEndAtom()
+        ba_num = ba.GetProp('molAtomMapNumber') if ba.HasProp('molAtomMapNumber') else '0'
+        ea_num = ea.GetProp('molAtomMapNumber') if ea.HasProp('molAtomMapNumber') else '0'
+        if (ba_num not in conserved_maps) or (ea_num not in conserved_maps): continue
+        nums = sorted([ba_num, ea_num])
+        bonds_new['{}~{}'.format(nums[0], nums[1])] = bond.GetBondTypeAsDouble()
+    for atom in to_mol.GetAtoms():
+        a_num = atom.GetProp('molAtomMapNumber') if atom.HasProp('molAtomMapNumber') else '0'
+        if a_num not in conserved_maps: continue
+        atoms_new[a_num] = atom.GetTotalNumHs()
+
+    for bond in bonds_prev:
+        if bond not in bonds_new:
+            bond_changes.add((bond.split('~')[0], bond.split('~')[1], 0.0)) # lost bond
+        else:
+            if bonds_prev[bond] != bonds_new[bond]:
+                bond_changes.add((bond.split('~')[0], bond.split('~')[1], bonds_new[bond])) # changed bond
+    for bond in bonds_new:
+        if bond not in bonds_prev:
+            bond_changes.add((bond.split('~')[0], bond.split('~')[1], bonds_new[bond]))  # new bond
+
+    for atom in atoms_prev:
+        if atom in atoms_new and atoms_prev[atom] != atoms_new[atom]:
+            if atom not in [c[0] for c in bond_changes] + [c[1] for c in bond_changes]:
+                atom_changes.add((atom, )) # changed atom
+
+    return bond_changes.union(atom_changes)
+
+
+def process_file(fpath):
+    with open(fpath, 'r') as fid_in, open(fpath + '.proc', 'w') as fid_out:
+        for line in tqdm(fid_in):
+            rxn_smi = line.strip().split(' ')[0]
+            bond_changes = get_changed_bonds(rxn_smi)
+            fid_out.write('{} {}\n'.format(rxn_smi, ';'.join(['{}-{}-{}'.format(x[0], x[1], x[2]) for x in bond_changes])))
+    print('Finished processing {}'.format(fpath))
+
+    
+if __name__ == '__main__':
+    # Test summarization
+    for rxn_smi in [
+            '[CH2:15]([CH:16]([CH3:17])[CH3:18])[Mg+:19].[OH:1][c:2]1[n:3][cH:4][c:5]([C:6](=[O:7])[N:8]([O:9][CH3:10])[CH3:11])[cH:12][cH:13]1>>[OH:1][c:2]1[n:3][cH:4][c:5]([C:6](=[O:7])[CH2:15][CH:16]([CH3:17])[CH3:18])[cH:12][cH:13]1',
+            '[CH3:14][NH2:15].[N+:1](=[O:2])([O-:3])[c:4]1[cH:5][c:6]([C:7](=[O:8])[OH:9])[cH:10][cH:11][c:12]1[Cl:13]>>[N+:1](=[O:2])([O-:3])[c:4]1[cH:5][c:6]([C:7](=[O:8])[OH:9])[cH:10][cH:11][c:12]1[NH:15][CH3:14]',
+            '[CH2:1]([CH3:2])[n:3]1[cH:4][c:5]([C:22](=[O:23])[OH:24])[c:6](=[O:21])[c:7]2[cH:8][c:9]([F:20])[c:10](-[c:13]3[cH:14][cH:15][c:16]([NH2:19])[cH:17][cH:18]3)[cH:11][c:12]12.[CH:25](=[O:26])[OH:27]>>[CH2:1]([CH3:2])[n:3]1[cH:4][c:5]([C:22](=[O:23])[OH:24])[c:6](=[O:21])[c:7]2[cH:8][c:9]([F:20])[c:10](-[c:13]3[cH:14][cH:15][c:16]([NH:19][CH:25]=[O:26])[cH:17][cH:18]3)[cH:11][c:12]12',
+            'O=[N+:1]([O-])[c:2]1[cH:3][cH:4][cH:5][c:6]2[nH:7][cH:8][cH:9][c:10]12>>[NH2:1][c:2]1[cH:3][cH:4][cH:5][c:6]2[nH:7][cH:8][cH:9][c:10]12',
+            'O=[C:1]([C:2]([CH3:3])([CH3:4])[CH3:5])[CH2:6]Br.[NH2:7][NH:8][C:9]([NH2:10])=[S:11]>>[c:1]1([C:2]([CH3:3])([CH3:4])[CH3:5])[cH:6][s:11][c:9]([NH:8][NH2:7])[n:10]1'
+            ]:
+        to_smi, from_smi = rxn_smi.split('>>')
+        print(rxn_smi)
+        print(get_changed_bonds(from_smi, to_smi))
+        print()
+
+##############################################################################
+# get changeed atoms from rxn: Rct ==> prd
+# return: prd, changed_atom_numbers
+##############################################################################
+
+from rdkit import Chem
+from rdchiral.main import rdchiralRunText
+
+
+def get_outcome_smiles_and_numbers(reaction_smarts, reactant_smiles):
+    _, mapped_outcomes = rdchiralRunText(reaction_smarts, reactant_smiles, return_mapped=True)
+    if len(mapped_outcomes) > 1:
+        raise
+    product_smiles_with_num, nums = list(mapped_outcomes.items())[0][1]
+    return product_smiles_with_num, nums
+
+
+def get_prd_num_rct(rxn_smi):
+    """rxn: Rct ==> prd"""
+    rct_smi, prd_smi = rxn_smi.split('>>')
+    print('m_orig', prd_smi)
+    print()
+    m_orig = Chem.MolFromSmiles(prd_smi)
+    
+    changed_atom_numbers = []
+    rct_smi_list = rct_smi.split('.')
+
+    for rct_smi_part in rct_smi_list:
+        print(rct_smi_part)
+        prd_mol = Chem.MolFromSmiles(prd_smi)
+        rct_mol = Chem.MolFromSmiles(rct_smi_part)
+        # remove atom_map_num from unmapped atom
+        rct_atom_mapnums = [
+            atom.GetAtomMapNum() for atom in rct_mol.GetAtoms()]
+        for atom in prd_mol.GetAtoms():
+            if atom.GetAtomMapNum() not in rct_atom_mapnums:
+                atom.SetAtomMapNum(0)
+        prd_smi_part = Chem.MolToSmiles(prd_mol)
+        
+        # get indices of changed atoms
+        rxn_smi_part = rct_smi_part + '>>' + prd_smi_part
+        prd_smi_with_num, rct_indices = get_outcome_smiles_and_numbers(rxn_smi_part, rct_smi_part)
+        for idx in rct_indices:
+            changed_atom_numbers.append( rct_mol.GetAtomWithIdx(idx-1).GetAtomMapNum() )
+
+    return prd_smi, atom_numbers
+
+
+if __name__ == '__main__':
+    
+    prd_smiles = 'Nc1cccc2[nH]ccc12'
+    rxn_smiles = 'O=[N+:1]([O-])[c:2]1[cH:3][cH:4][cH:5][c:6]2[nH:7][cH:8][cH:9][c:10]12>>[NH2:1][c:2]1[cH:3][cH:4][cH:5][c:6]2[nH:7][cH:8][cH:9][c:10]12'
+
+    # prd_smiles = 'CC(C)(C)c1csc(NN)n1'
+    # rxn_smiles = 'O=[C:1]([C:2]([CH3:3])([CH3:4])[CH3:5])[CH2:6]Br.[NH2:7][NH:8][C:9]([NH2:10])=[S:11]>>[c:1]1([C:2]([CH3:3])([CH3:4])[CH3:5])[cH:6][s:11][c:9]([NH:8][NH2:7])[n:10]1'
+
+    get_prd_num_rct(rxn_smiles)
+
+##############################################################################
