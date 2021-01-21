@@ -1,0 +1,2187 @@
+
+    ###################################################
+    ###################################################
+    # test.sh
+    ###################################################
+    ###################################################
+# preparation
+# ===========
+# examples.txt : product smiles (1 product per line)
+# examples-tgt.txt : reactant smiles (1 reactant set per line)
+#
+# output
+# ======
+# examples-pred.txt : reactants predicted by the model
+
+
+
+MODEL_DATATYPE=Eclair
+BEAM=50
+N_BEST=10
+
+python inference.py --dataset $MODEL_DATATYPE
+
+# model=./checkpoints/${MODEL_DATATYPE}_untyped/${MODEL_DATATYPE}_untyped_model_step_170000.pt
+model=./checkpoints/${MODEL_DATATYPE}_untyped/average_model.pt
+
+src=./data/TEST/src-test-prediction.txt
+tgt=./examples-tgt.txt
+output=./examples-pred.txt
+python ./OpenNMT-py/onmt/bin/translate.py \
+    --model $model --gpu 0 --src $src --output $output \
+    --beam_size $BEAM  --n_best $N_BEST \
+    --batch_size 32 --replace_unk --max_length 300
+
+python  ./OpenNMT-py/score_predictions.py --beam_size $N_BEST --invalid_smiles \
+    --predictions $output --targets  $tgt --sources  $src
+
+    ###################################################
+    ###################################################
+    # run.sh
+    ###################################################
+    ###################################################
+DATASET=Eclair
+MIN_FREQ=10
+DATASET_ONMT=./data/${DATASET}/opennmt_data-aug-untyped
+
+# python preprocessing.py --data $DATASET
+# python prepare_data.py  --data $DATASET
+
+#############################################################
+
+# # # Start to train EGAT model
+# user.sub q=InvDesign_gpu gputype=m40 ngpu=1 python train.py --dataset $DATASET --min_freq $MIN_FREQ
+
+# evaluate on test data & make step-2 test data
+# python train.py --dataset $DATASET --min_freq $MIN_FREQ --test_only --load
+# python prepare_test_prediction.py --dataset $DATASET --min_freq $MIN_FREQ 
+
+# evaluate on training data & make step-2 training data
+# python train.py --dataset $DATASET --min_freq $MIN_FREQ --test_on_train --load
+# python prepare_train_error_aug.py --dataset $DATASET --min_freq $MIN_FREQ 
+
+#############################################################
+# # bash preprocess.sh
+# python  ./OpenNMT-py/onmt/bin/preprocess.py \
+#     -train_src ${DATASET_ONMT}/src-train-aug-err.txt \
+#     -train_tgt  ${DATASET_ONMT}/tgt-train-aug-err.txt \
+#     --valid_src  ${DATASET_ONMT}/src-valid.txt \
+#     --valid_tgt  ${DATASET_ONMT}/tgt-valid.txt \
+#     -save_data  ${DATASET_ONMT}/${DATASET}_untyped \
+#     --src_seq_length 1000 --tgt_seq_length 1000 \
+#     --src_vocab_size 1000 --tgt_vocab_size 1000 --share_vocab  --overwrite
+
+#############################################################
+
+prefix=./checkpoints/${DATASET}_untyped
+python ./OpenNMT-py/onmt/bin/average_models.py \
+    -output ${prefix}/average_model.pt \
+    -models ${prefix}/Eclair_untyped_model_step_150000.pt \
+            ${prefix}/Eclair_untyped_model_step_140000.pt \
+            ${prefix}/Eclair_untyped_model_step_130000.pt \
+            ${prefix}/Eclair_untyped_model_step_160000.pt \
+            ${prefix}/Eclair_untyped_model_step_170000.pt 
+
+# python  ./OpenNMT-py/onmt/bin/train.py \
+#     --data ./data/${DATASET}/opennmt_data-aug-untyped/${DATASET}_untyped \
+#     --save_model ./checkpoints/${DATASET}_untyped/${DATASET}_untyped_model \
+#     --world_size 1 --gpu_ranks 0 \
+#     --save_checkpoint_steps 10000 --keep_checkpoint 10 --seed 42\
+#     --train_steps 300000 --param_init 0  --param_init_glorot --max_generator_batches 32 \
+#     --batch_size 4096 --batch_type tokens --normalization tokens --max_grad_norm 0  --accum_count 4 \
+#     --optim adam --adam_beta1 0.9 --adam_beta2 0.998 --decay_method noam --warmup_steps 8000  \
+#     --learning_rate 2 --label_smoothing 0.0 --report_every 1000 --valid_steps 10000 \
+#     --layers 4 --rnn_size 256 --word_vec_size 256 --encoder_type transformer --decoder_type transformer \
+#     --dropout 0.1 --position_encoding --share_embeddings \
+#     --global_attention general --global_attention_function softmax --self_attn_type scaled-dot \
+#     --heads 8 --transformer_ff 2048 --master_port 10002 \
+#     2>&1 | tee -a train_batch_step2_output.log
+
+#############################################################
+
+
+src=${DATASET_ONMT}/src-test-prediction.txt
+tgt=${DATASET_ONMT}/tgt-test.txt
+output=${DATASET_ONMT}/predictions_on_${DATASET}_test-prediction.txt
+beam=20
+n_best=10
+
+# python ./OpenNMT-py/onmt/bin/translate.py \
+#     --model ./checkpoints/${DATASET}_untyped/average_model.pt \
+#     --gpu 0 --src $src --output $output \
+#     --beam_size $beam  --n_best $n_best \
+#     --batch_size 32 --replace_unk --max_length 300
+# python  ./OpenNMT-py/score_predictions.py  \
+#     --beam_size $n_best --invalid_smiles \
+#     --predictions $output --targets $tgt --sources $src
+
+
+#############################################################
+
+
+    ###################################################
+    ###################################################
+    # train.py
+    ###################################################
+    ###################################################
+import argparse
+
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import MultiStepLR
+from data import *
+from model.gat import *
+from util.misc import CSVLogger
+
+
+def collate(data):
+    return map(list, zip(*data))
+
+
+def test(GAT_model, test_dataloader, data_split='test', save_pred=False):
+    GAT_model.eval()
+    correct = 0.
+    total = 0.
+    epoch_loss = 0.
+    # Bond disconnection probability
+    pred_true_list = []
+    pred_logits_mol_list = []
+    # Bond disconnection number gt and prediction
+    bond_change_gt_list = []
+    bond_change_pred_list = []
+    for i, data in enumerate(tqdm(test_dataloader)):
+        rxn_class, x_pattern_feat, x_atom, x_adj, x_graph, y_adj, disconnection_num = data
+
+        x_atom = list(map(lambda x: torch.from_numpy(x).float(), x_atom))
+        x_pattern_feat = list(
+            map(lambda x: torch.from_numpy(x).float(), x_pattern_feat))
+        x_atom = list(
+            map(lambda x, y: torch.cat([x, y], dim=1), x_atom, x_pattern_feat))
+
+        if args.typed:
+            rxn_class = list(
+                map(lambda x: torch.from_numpy(x).float(), rxn_class))
+            x_atom = list(
+                map(lambda x, y: torch.cat([x, y], dim=1), x_atom, rxn_class))
+
+        x_atom = torch.cat(x_atom, dim=0)
+        disconnection_num = torch.LongTensor(disconnection_num)
+        if not args.use_cpu:
+            x_atom = x_atom.cuda()
+            disconnection_num = disconnection_num.cuda()
+
+        x_adj = list(map(lambda x: torch.from_numpy(np.array(x)), x_adj))
+        y_adj = list(map(lambda x: torch.from_numpy(np.array(x)), y_adj))
+        if not args.use_cpu:
+            x_adj = [xa.cuda() for xa in x_adj]
+            y_adj = [ye.cuda() for ye in y_adj]
+
+        mask = list(map(lambda x: x.view(-1, 1).bool(), x_adj))
+        bond_disconnections = list(
+            map(lambda x, y: torch.masked_select(x.view(-1, 1), y), y_adj,
+                mask))
+        bond_labels = torch.cat(bond_disconnections, dim=0).float()
+
+        # batch graph
+        g_dgl = dgl.batch(x_graph)
+        h_pred, e_pred = GAT_model(g_dgl, x_atom)
+        e_pred = e_pred.squeeze()
+        loss_h = nn.CrossEntropyLoss(reduction='sum')(h_pred,
+                                                      disconnection_num)
+        loss_ce = nn.BCEWithLogitsLoss(reduction='sum')(e_pred, bond_labels)
+        loss = loss_ce + loss_h
+        epoch_loss += loss.item()
+
+        h_pred = torch.argmax(h_pred, dim=1)
+        bond_change_pred_list.extend(h_pred.cpu().tolist())
+        bond_change_gt_list.extend(disconnection_num.cpu().tolist())
+
+        start = end = 0
+        pred = torch.sigmoid(e_pred)
+        edge_lens = list(map(lambda x: x.shape[0], bond_disconnections))
+        cur_batch_size = len(edge_lens)
+        bond_labels = bond_labels.long()
+        for j in range(cur_batch_size):
+            start = end
+            end += edge_lens[j]
+            label_mol = bond_labels[start:end]
+            pred_proab = pred[start:end]
+            mask_pos = torch.nonzero(x_adj[j]).tolist()
+            assert len(mask_pos) == len(pred_proab)
+
+            pred_disconnection_adj = torch.zeros_like(x_adj[j], dtype=torch.float32)
+            for idx, pos in enumerate(mask_pos):
+                pred_disconnection_adj[pos[0], pos[1]] = pred_proab[idx]
+            for idx, pos in enumerate(mask_pos):
+                pred_proab[idx] = (pred_disconnection_adj[pos[0], pos[1]] + pred_disconnection_adj[pos[1], pos[0]]) / 2
+
+            pred_mol = pred_proab.round().long()
+            if torch.equal(pred_mol, label_mol):
+                correct += 1
+                pred_true_list.append(True)
+                pred_logits_mol_list.append([
+                    True,
+                    label_mol.tolist(),
+                    pred_proab.tolist(),
+                ])
+            else:
+                pred_true_list.append(False)
+                pred_logits_mol_list.append([
+                    False,
+                    label_mol.tolist(),
+                    pred_proab.tolist(),
+                ])
+            total += 1
+
+    pred_lens_true_list = list(
+        map(lambda x, y: x == y, bond_change_gt_list, bond_change_pred_list))
+    bond_change_pred_list = list(
+        map(lambda x, y: [x, y], bond_change_gt_list, bond_change_pred_list))
+    if save_pred:
+        print('pred_true_list size:', len(pred_true_list))
+        prefix = 'logs/{}/{}'.format(args.exp_name, data_split)
+        np.savetxt(prefix + '_disconnection.txt',
+                   np.asarray(bond_change_pred_list), fmt='%d')
+        np.savetxt(prefix + '_result.txt', np.asarray(pred_true_list), fmt='%d')
+        with open(prefix + '_result_mol.txt', 'w') as f:
+            for idx, line in enumerate(pred_logits_mol_list):
+                f.write('{} {}\n'.format(idx, line[0]))
+                f.write(' '.join([str(i) for i in line[1]]) + '\n')
+                f.write(' '.join([str(i) for i in line[2]]) + '\n')
+
+    print('Bond disconnection number prediction acc: {:.6f}'.format(
+        np.mean(pred_lens_true_list)))
+    print('Loss: ', epoch_loss / total)
+    acc = correct / total
+    print('Bond disconnection acc (without auxiliary task): {:.6f}'.format(acc))
+    return acc
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--min_freq',
+                        type=int,
+                        default=10,
+                        help='min_semi_template')
+    parser.add_argument('--batch_size',
+                        type=int,
+                        default=32,
+                        help='input batch size for training (default: 128)')
+    parser.add_argument('--epochs',
+                        type=int,
+                        default=80,
+                        help='number of epochs to train (default: 20)')
+    parser.add_argument('--in_dim',
+                        type=int,
+                        # default=697, # 47 + 646 + 4? # USPTO
+                        # default=1259,  # Eclair
+                        default=1304,
+                        help='dim of atom feature')
+    parser.add_argument('--lr', type=float, default=5e-4, help='learning rate')
+    parser.add_argument('--seed',
+                        type=int,
+                        default=123,
+                        help='random seed (default: 123)')
+    parser.add_argument('--logdir', type=str, default='logs', help='logdir name')
+    parser.add_argument('--dataset', type=str, default='Eclair', help='dataset')
+    parser.add_argument('--hidden_dim', type=int, default=128, help='hidden_dim')
+    parser.add_argument('--heads', type=int, default=4, help='number of heads')
+    parser.add_argument('--gat_layers',
+                        type=int,
+                        default=3,
+                        help='number of gat layers')
+    parser.add_argument('--valid_only',
+                        action='store_true',
+                        default=False,
+                        help='valid_only')
+    parser.add_argument('--test_only',
+                        action='store_true',
+                        default=False,
+                        help='test_only')
+    parser.add_argument('--test_on_train',
+                        action='store_true',
+                        default=False,
+                        help='run testing on training data')
+    parser.add_argument('--typed',
+                        action='store_true',
+                        default=False,
+                        help='if given reaction types')
+    parser.add_argument('--use_cpu',
+                        action='store_true',
+                        default=False,
+                        help='use gpu or cpu')
+    parser.add_argument('--load',
+                        action='store_true',
+                        default=False,
+                        help='load model checkpoint.')
+    args = parser.parse_args()
+
+    batch_size = args.batch_size
+    epochs = args.epochs
+    data_root = os.path.join('data', args.dataset)
+    args.exp_name = args.dataset
+    if args.typed:
+        args.in_dim += 10
+        args.exp_name += '_typed'
+    else:
+        args.exp_name += '_untyped'
+    print(args)
+
+    if not os.path.exists('logs/{}'.format(args.exp_name)):
+        os.mkdir('logs/{}'.format(args.exp_name))
+
+    filename = 'logs/' + args.logdir + '.csv'
+    csv_logger = CSVLogger(
+        args=args,
+        fieldnames=['epoch', 'train_acc', 'valid_acc', 'train_loss'],
+        filename=filename,
+    )
+
+    GAT_model = GATNet(
+        in_dim=args.in_dim,
+        num_layers=args.gat_layers,
+        hidden_dim=args.hidden_dim,
+        heads=args.heads,
+        use_gpu=(args.use_cpu == False),
+    )
+
+    if args.use_cpu:
+        device = 'cpu'
+    else:
+        GAT_model = GAT_model.cuda()
+        device = 'cuda:0'
+
+    if args.load:
+        GAT_model.load_state_dict(
+            torch.load('checkpoints/{}_checkpoint.pt'.format(args.exp_name),
+                       map_location=torch.device(device)), )
+        args.lr *= 0.2
+        milestones = []
+    else:
+        milestones = [20, 40, 60, 80]
+
+    optimizer = torch.optim.Adam([{
+        'params': GAT_model.parameters()
+    }],
+                                 lr=args.lr)
+    scheduler = MultiStepLR(optimizer, milestones=milestones, gamma=0.2)
+
+    if args.test_only:
+        test_data = RetroCenterDatasets(root=data_root, data_split='test', 
+                                        min_freq=args.min_freq)
+        test_dataloader = DataLoader(test_data,
+                                     batch_size=4 * batch_size,
+                                     shuffle=False,
+                                     num_workers=0,
+                                     collate_fn=collate)
+        test(GAT_model, test_dataloader, data_split='test', save_pred=True)
+        exit(0)
+
+    valid_data = RetroCenterDatasets(root=data_root, data_split='valid', 
+                                     min_freq=args.min_freq)
+    valid_dataloader = DataLoader(valid_data,
+                                  batch_size=4 * batch_size,
+                                  shuffle=False,
+                                  num_workers=0,
+                                  collate_fn=collate)
+    if args.valid_only:
+        test(GAT_model, valid_dataloader)
+        exit(0)
+
+    train_data = RetroCenterDatasets(root=data_root, data_split='train', 
+                                     min_freq=args.min_freq)
+    train_dataloader = DataLoader(train_data,
+                                  batch_size=batch_size,
+                                  shuffle=True,
+                                  num_workers=0,
+                                  collate_fn=collate)
+    if args.test_on_train:
+        test_train_dataloader = DataLoader(train_data,
+                                           batch_size=8 * batch_size,
+                                           shuffle=False,
+                                           num_workers=0,
+                                           collate_fn=collate)
+        test(GAT_model, test_train_dataloader, data_split='train', save_pred=True)
+        exit(0)
+
+    # Record epoch start time
+    for epoch in range(1, 1 + epochs):
+        total = 0.
+        correct = 0.
+        epoch_loss = 0.
+        epoch_loss_ce = 0.
+        epoch_loss_h = 0.
+        GAT_model.train()
+        progress_bar = tqdm(train_dataloader)
+        for i, data in enumerate(progress_bar):
+            progress_bar.set_description('Epoch ' + str(epoch))
+            rxn_class, x_pattern_feat, x_atom, x_adj, x_graph, y_adj, disconnection_num = data
+
+            x_atom = list(map(lambda x: torch.from_numpy(x).float(), x_atom))
+            x_pattern_feat = list(
+                map(lambda x: torch.from_numpy(x).float(), x_pattern_feat))
+            x_atom = list(
+                map(lambda x, y: torch.cat([x, y], dim=1), x_atom,
+                    x_pattern_feat))
+
+            if args.typed:
+                rxn_class = list(
+                    map(lambda x: torch.from_numpy(x).float(), rxn_class))
+                x_atom = list(
+                    map(lambda x, y: torch.cat([x, y], dim=1), x_atom,
+                        rxn_class))
+
+            x_atom = torch.cat(x_atom, dim=0)
+            disconnection_num = torch.LongTensor(disconnection_num)
+            if not args.use_cpu:
+                x_atom = x_atom.cuda()
+                disconnection_num = disconnection_num.cuda()
+
+            x_adj = list(map(lambda x: torch.from_numpy(np.array(x)), x_adj))
+            y_adj = list(map(lambda x: torch.from_numpy(np.array(x)), y_adj))
+            if not args.use_cpu:
+                x_adj = [xa.cuda() for xa in x_adj]
+                y_adj = [ye.cuda() for ye in y_adj]
+
+            mask = list(map(lambda x: x.view(-1, 1).bool(), x_adj))
+            bond_connections = list(
+                map(lambda x, y: torch.masked_select(x.view(-1, 1), y), y_adj,
+                    mask))
+            bond_labels = torch.cat(bond_connections, dim=0).float()
+
+            GAT_model.zero_grad()
+            # batch graph
+            g_dgl = dgl.batch(x_graph)
+            h_pred, e_pred = GAT_model(g_dgl, x_atom)
+            e_pred = e_pred.squeeze()
+            loss_h = nn.CrossEntropyLoss(reduction='sum')(h_pred,
+                                                          disconnection_num)
+            loss_ce = nn.BCEWithLogitsLoss(reduction='sum')(e_pred,
+                                                            bond_labels)
+            loss = loss_ce + loss_h
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            epoch_loss_ce += loss_ce.item()
+            epoch_loss_h += loss_h.item()
+
+            start = end = 0
+            pred = torch.round(torch.sigmoid(e_pred)).long()
+            edge_lens = list(map(lambda x: x.shape[0], bond_connections))
+            cur_batch_size = len(edge_lens)
+            bond_labels = bond_labels.long()
+            for j in range(cur_batch_size):
+                start = end
+                end += edge_lens[j]
+                if torch.equal(pred[start:end], bond_labels[start:end]):
+                    correct += 1
+            assert end == len(pred)
+
+            total += cur_batch_size
+            progress_bar.set_postfix(
+                loss='%.5f' % (epoch_loss / total),
+                acc='%.5f' % (correct / total),
+                loss_ce='%.5f' % (epoch_loss_ce / total),
+                loss_h='%.5f' % (epoch_loss_h / total),
+            )
+
+        scheduler.step(epoch)
+        train_acc = correct / total
+        train_loss = epoch_loss / total
+        print('Train Loss: {:.5f}'.format(train_loss))
+        print('Train Bond Disconnection Acc: {:.5f}'.format(train_acc))
+
+        if epoch % 5 == 0:
+            valid_acc = test(GAT_model, valid_dataloader)
+            row = {
+                'epoch': str(epoch),
+                'train_acc': str(train_acc),
+                'valid_acc': str(valid_acc),
+                'train_loss': str(train_loss),
+            }
+            csv_logger.writerow(row)
+            torch.save(GAT_model.state_dict(),
+                       'checkpoints/{}_checkpoint_{}.pt'
+                       .format(args.exp_name, epoch))
+
+    csv_logger.close()
+    torch.save(GAT_model.state_dict(),
+               'checkpoints/{}_checkpoint.pt'.format(args.exp_name))
+
+
+    ###################################################
+    ###################################################
+    # prepare_train_error_aug.py
+    ###################################################
+    ###################################################
+import argparse
+import re
+import os
+import pickle
+import numpy as np
+
+from tqdm import tqdm
+from rdkit import Chem
+from collections import Counter
+# Get the mapping numbers in a SMILES.
+def get_idx(smarts):
+    item = re.findall('(?<=:)\d+', smarts)
+    item = list(map(int, item))
+    return item
+
+def smi_tokenizer(smi):
+    pattern =  "(\[[^\]]+]|Br?|Cl?|N|O|S|P|F|I|b|c|n|o|s|p|\(|\)|\.|=|#|-|\+|\\\\|\/|:|~|@|\?|>|\*|\$|\%[0-9]{2}|[0-9])"
+    regex = re.compile(pattern)
+    tokens = [token for token in regex.findall(smi)]
+    assert smi == ''.join(tokens)
+    return ' '.join(tokens)
+
+# Convert smarts to smiles by remove mapping numbers
+def smarts2smiles(smarts, canonical=True):
+    t = re.sub(':\d*', '', smarts)
+    mol = Chem.MolFromSmiles(t, sanitize=False)
+    return Chem.MolToSmiles(mol, canonical=canonical)
+
+def get_smarts_pieces(mol, src_adj, target_adj, add_bond=False):
+    m, n = src_adj.shape
+    emol = Chem.EditableMol(mol)
+    for j in range(m):
+        for k in range(j + 1, n):
+            if target_adj[j][k] == src_adj[j][k]:
+                continue
+            if 0 == target_adj[j][k]:
+                emol.RemoveBond(j, k)
+            elif add_bond:
+                emol.AddBond(j, k, Chem.rdchem.BondType.SINGLE)
+    synthon_smiles = Chem.MolToSmiles(emol.GetMol(), isomericSmiles=True)
+    return synthon_smiles
+
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--min_freq',
+                        type=int,
+                        default=10,
+                        help='min_semi_template')
+    parser.add_argument('--dataset',
+                        type=str,
+                        default='Eclair',
+                        help='dataset: USPTO50K')
+    parser.add_argument('--typed',
+                        action='store_true',
+                        default=False,
+                        help='if given reaction types')
+    args = parser.parse_args()
+
+    assert args.dataset in ['USPTO50K', 'USPTO-full', 'Eclair']
+    if args.typed:
+        args.typed = 'typed'
+        args.output_suffix = '-aug-typed'
+    else:
+        args.typed = 'untyped'
+        args.output_suffix = '-aug-untyped'
+    print(args)
+
+    logdir = 'logs/{0}_{1}'.format(args.dataset, args.typed)
+
+    pred_results = logdir + '/train_result_mol.txt'
+    with open(pred_results) as f:
+        pred_results = f.readlines()
+
+    bond_pred_results = logdir + '/train_disconnection.txt'
+    with open(bond_pred_results) as f:
+        bond_pred_results = f.readlines()
+
+    dataset_dir = 'data/{}/train'.format(args.dataset)
+
+    print('load rxn data from', dataset_dir)
+    with open(os.path.join(dataset_dir, 
+              'rxn_data_filtered_minfreq_%d.pkl' % args.min_freq), 'rb') as f:
+        rxn_data_dict = pickle.load(f)
+
+    product_adjs = []
+    product_mols = []
+    product_smiles = []
+    for _, reaction_data in tqdm(rxn_data_dict.items()):
+        product_adjs.append(reaction_data['product_adj'])
+        product_mols.append(reaction_data['product_mol'])
+        product_smiles.append(Chem.MolToSmiles(reaction_data['product_mol'], canonical=False))
+
+    assert len(product_smiles) == len(bond_pred_results)
+
+
+
+    cnt = 0
+    guided_pred_results = []
+    bond_disconnection = []
+    bond_disconnection_gt = []
+    for i in tqdm(range(len(bond_pred_results))):
+        bond_pred_items = bond_pred_results[i].strip().split()
+        bond_change_num = int(bond_pred_items[1]) * 2
+        bond_change_num_gt = int(bond_pred_items[0]) * 2
+
+        gt_adj_list = pred_results[3 * i + 1].strip().split(' ')
+        gt_adj_list = [int(k) for k in gt_adj_list]
+        gt_adj_index = np.argsort(gt_adj_list)
+        gt_adj_index = gt_adj_index[:bond_change_num_gt]
+
+        pred_adj_list = pred_results[3 * i + 2].strip().split(' ')
+        pred_adj_list = [float(k) for k in pred_adj_list]
+        pred_adj_index = np.argsort(pred_adj_list)
+        pred_adj_index = pred_adj_index[:bond_change_num]
+
+        bond_disconnection.append(pred_adj_index)
+        bond_disconnection_gt.append(gt_adj_index)
+        res = set(gt_adj_index) == set(pred_adj_index)
+        guided_pred_results.append(int(res))
+        cnt += res
+
+
+    print('guided bond_disconnection prediction cnt and acc:', cnt, cnt / len(bond_pred_results))
+    print('bond_disconnection len:', len(bond_disconnection))
+
+    loaddir = os.path.join('./data', args.dataset, 'opennmt_data')
+    with open(os.path.join(loaddir, 'src-train.txt')) as f:
+        srcs = f.readlines()
+    with open(os.path.join(loaddir, 'tgt-train.txt')) as f:
+        tgts = f.readlines()
+
+
+    # Generate synthons from bond disconnection prediction
+    sources = []
+    targets = []
+    for i, prod_adj in tqdm(enumerate(product_adjs)):
+        if guided_pred_results[i] == 1:
+            continue
+        x_adj = np.array(prod_adj)
+        # find 1 index
+        idxes = np.argwhere(x_adj > 0)
+        pred_adj = prod_adj.copy()
+        for k in bond_disconnection[i]:
+            idx = idxes[k]
+            assert pred_adj[idx[0], idx[1]] == 1
+            pred_adj[idx[0], idx[1]] = 0
+
+        pred_synthon = get_smarts_pieces(product_mols[i], prod_adj, pred_adj)
+
+
+        reactants = tgts[i].split('.')
+        reactants = [r.strip() for r in reactants]
+
+        syn_idx_list = [get_idx(s) for s in pred_synthon.split('.')]
+        react_idx_list = [get_idx(r) for r in reactants]
+        react_max_common_synthon_index = []
+        for react_idx in react_idx_list:
+            react_common_idx_cnt = []
+            for syn_idx in syn_idx_list:
+                common_idx = list(set(syn_idx) & set(react_idx))
+                react_common_idx_cnt.append(len(common_idx))
+            max_cnt = max(react_common_idx_cnt)
+            react_max_common_index = react_common_idx_cnt.index(max_cnt)
+            react_max_common_synthon_index.append(react_max_common_index)
+        react_synthon_index = np.argsort(react_max_common_synthon_index).tolist()
+        reactants = [reactants[k] for k in react_synthon_index]
+
+        # remove mapping number
+        syns = pred_synthon.split('.')
+        syns = [smarts2smiles(s, canonical=False) for s in syns]
+        syns = [smi_tokenizer(s) for s in syns]
+        src_items = srcs[i].strip().split(' ')
+        src_items[2] = smi_tokenizer(smarts2smiles(src_items[2]))
+        if args.typed == 'untyped':
+            src_items[1] = '[RXN_0]'
+        src_line = ' '.join(src_items[1:4]) + ' ' + ' . '.join(syns) + '\n'
+
+        reactants = [smi_tokenizer(smarts2smiles(r)) for r in reactants]
+        tgt_line = ' . '.join(reactants) + '\n'
+
+        sources.append(src_line)
+        targets.append(tgt_line)
+
+    print('augmentation data size:', len(sources))
+
+
+    savedir = 'data/{}/opennmt_data{}'.format(args.dataset, args.output_suffix)
+    with open(os.path.join(savedir, 'src-train-aug.txt')) as f:
+        srcs = f.readlines()
+    with open(os.path.join(savedir, 'tgt-train-aug.txt')) as f:
+        tgts = f.readlines()
+
+    src_train_aug_err = os.path.join(savedir, 'src-train-aug-err.txt')
+    print('save src_train_aug_err:', src_train_aug_err)
+    with open(src_train_aug_err, 'w') as f:
+        f.writelines(srcs + sources)
+
+
+    tgt_train_aug_err = os.path.join(savedir, 'tgt-train-aug-err.txt')
+    print('save tgt_train_aug_err:', tgt_train_aug_err)
+    with open(tgt_train_aug_err, 'w') as f:
+        f.writelines(tgts + targets)
+
+
+
+    ###################################################
+    ###################################################
+    # prepare_test_prediction.py
+    ###################################################
+    ###################################################
+
+import argparse
+import re
+import os
+import pickle
+import numpy as np
+
+from tqdm import tqdm
+from rdkit import Chem
+from collections import Counter
+
+
+# Get the mapping numbers in a SMILES.
+def get_idx(smarts):
+    item = re.findall('(?<=:)\d+', smarts)
+    item = list(map(int, item))
+    return item
+
+def smi_tokenizer(smi):
+    pattern =  "(\[[^\]]+]|Br?|Cl?|N|O|S|P|F|I|b|c|n|o|s|p|\(|\)|\.|=|#|-|\+|\\\\|\/|:|~|@|\?|>|\*|\$|\%[0-9]{2}|[0-9])"
+    regex = re.compile(pattern)
+    tokens = [token for token in regex.findall(smi)]
+    assert smi == ''.join(tokens)
+    return ' '.join(tokens)
+
+# Convert smarts to smiles by remove mapping numbers
+def smarts2smiles(smarts, canonical=True):
+    t = re.sub(':\d*', '', smarts)
+    mol = Chem.MolFromSmiles(t, sanitize=False)
+    return Chem.MolToSmiles(mol, canonical=canonical)
+
+def get_smarts_pieces(mol, src_adj, target_adj, add_bond=False):
+    m, n = src_adj.shape
+    emol = Chem.EditableMol(mol)
+    for j in range(m):
+        for k in range(j + 1, n):
+            if target_adj[j][k] == src_adj[j][k]:
+                continue
+            if 0 == target_adj[j][k]:
+                emol.RemoveBond(j, k)
+            elif add_bond:
+                emol.AddBond(j, k, Chem.rdchem.BondType.SINGLE)
+    synthon_smiles = Chem.MolToSmiles(emol.GetMol(), isomericSmiles=True)
+    return synthon_smiles
+
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--min_freq',
+                        type=int,
+                        default=10,
+                        help='min_semi_template')
+    parser.add_argument('--dataset',
+                        type=str,
+                        default='Eclair',
+                        help='dataset: USPTO50K')
+    parser.add_argument('--typed',
+                        action='store_true',
+                        default=False,
+                        help='if given reaction types')
+    args = parser.parse_args()
+
+    assert args.dataset in ['USPTO50K', 'USPTO-full', 'Eclair']
+
+    if args.typed:
+        args.typed = 'typed'
+        args.output_suffix = '-aug-typed'
+    else:
+        args.typed = 'untyped'
+        args.output_suffix = '-aug-untyped'
+    print(args)
+
+    logdir = 'logs/{0}_{1}'.format(args.dataset, args.typed)
+
+    pred_results = logdir + '/test_result_mol.txt'
+    with open(pred_results) as f:
+        pred_results = f.readlines()
+
+    bond_pred_results = logdir + '/test_disconnection.txt'
+    with open(bond_pred_results) as f:
+        bond_pred_results = f.readlines()
+
+    dataset_dir = 'data/{}/test'.format(args.dataset)
+
+    print('load rxn data from', dataset_dir)
+    with open(os.path.join(dataset_dir, 
+              'rxn_data_filtered_minfreq_%d.pkl' % args.min_freq), 'rb') as f:
+        rxn_data_dict = pickle.load(f)
+
+    product_adjs = []
+    product_mols = []
+    product_smiles = []
+    for _, reaction_data in tqdm(rxn_data_dict.items()):
+        product_adjs.append(reaction_data['product_adj'])
+        product_mols.append(reaction_data['product_mol'])
+        product_smiles.append(Chem.MolToSmiles(reaction_data['product_mol'], canonical=False))
+
+    assert len(product_smiles) == len(bond_pred_results)
+
+
+
+    cnt = 0
+    guided_pred_results = []
+    bond_disconnection = []
+    bond_disconnection_gt = []
+    for i in range(len(bond_pred_results)):
+        bond_pred_items = bond_pred_results[i].strip().split()
+        bond_change_num = int(bond_pred_items[1]) * 2
+        bond_change_num_gt = int(bond_pred_items[0]) * 2
+
+        gt_adj_list = pred_results[3 * i + 1].strip().split(' ')
+        gt_adj_list = [int(k) for k in gt_adj_list]
+        gt_adj_index = np.argsort(gt_adj_list)
+        gt_adj_index = gt_adj_index[:bond_change_num_gt]
+
+        pred_adj_list = pred_results[3 * i + 2].strip().split(' ')
+        pred_adj_list = [float(k) for k in pred_adj_list]
+        pred_adj_index = np.argsort(pred_adj_list)
+        pred_adj_index = pred_adj_index[:bond_change_num]
+
+        bond_disconnection.append(pred_adj_index)
+        bond_disconnection_gt.append(gt_adj_index)
+        res = set(gt_adj_index) == set(pred_adj_index)
+        guided_pred_results.append(int(res))
+        cnt += res
+
+
+    print('guided bond_disconnection prediction cnt and acc:', cnt, cnt / len(bond_pred_results))
+    print('bond_disconnection len:', len(bond_disconnection))
+
+
+    # Generate synthons from bond disconnection prediction
+    synthons = []
+    for i, prod_adj in enumerate(product_adjs):
+        x_adj = np.array(prod_adj)
+        # find 1 index
+        idxes = np.argwhere(x_adj > 0)
+        pred_adj = prod_adj.copy()
+        for k in bond_disconnection[i]:
+            idx = idxes[k]
+            assert pred_adj[idx[0], idx[1]] == 1
+            pred_adj[idx[0], idx[1]] = 0
+
+        pred_synthon = get_smarts_pieces(product_mols[i], prod_adj, pred_adj)
+        synthons.append(pred_synthon)
+
+
+    loaddir = os.path.join('./data', args.dataset, 'opennmt_data')
+    with open(os.path.join(loaddir, 'src-test.txt')) as f:
+        srcs = f.readlines()
+    assert len(synthons) == len(srcs)
+
+
+    savedir = 'data/{}/opennmt_data{}'.format(args.dataset, args.output_suffix)
+    src_test_prediction = os.path.join(savedir, 'src-test-prediction.txt')
+    print('save src_test_prediction:', src_test_prediction)
+    cnt = 0
+    with open(src_test_prediction, 'w') as f:
+        for src, synthon in zip(srcs, synthons):
+            src_items = src.split(' ')
+            src_items[2] = smi_tokenizer(smarts2smiles(src_items[2]))
+            if args.typed == 'untyped':
+                src_items[1] = '[RXN_0]'
+
+            syns = synthon.split('.')
+            syns = [smarts2smiles(s, canonical=False) for s in syns]
+
+            # Double check the synthon prediction accuracy
+            syns_gt = [smarts2smiles(s, canonical=False) for s in src_items[4:] if s != '.']
+            cnt += set(syns_gt) == set(syns)
+
+            syns = [smi_tokenizer(s) for s in syns]
+            src_line = ' '.join(src_items[1:4]) + ' ' + ' . '.join(syns) + '\n'
+            f.write(src_line)
+
+    print('double check guided synthon prediction acc:', cnt / len(synthons))
+
+
+    ###################################################
+    ###################################################
+    # prepare_data.py
+    ###################################################
+    ###################################################
+import argparse
+import re
+import os
+import pickle
+import numpy as np
+
+from tqdm import tqdm
+from rdkit import Chem
+from collections import Counter
+
+
+# Get the mapping numbers in a SMILES.
+def get_idx(smarts):
+    item = re.findall('(?<=:)\d+', smarts)
+    item = list(map(int, item))
+    return item
+
+def smi_tokenizer(smi):
+    pattern =  "(\[[^\]]+]|Br?|Cl?|N|O|S|P|F|I|b|c|n|o|s|p|\(|\)|\.|=|#|-|\+|\\\\|\/|:|~|@|\?|>|\*|\$|\%[0-9]{2}|[0-9])"
+    regex = re.compile(pattern)
+    tokens = [token for token in regex.findall(smi)]
+    assert smi == ''.join(tokens)
+    return ' '.join(tokens)
+
+# Convert smarts to smiles by remove mapping numbers
+def smarts2smiles(smarts, canonical=True):
+    t = re.sub(':\d*', '', smarts)
+    mol = Chem.MolFromSmiles(t, sanitize=False)
+    return Chem.MolToSmiles(mol, canonical=canonical)
+
+
+if __name__ == '__main__':
+
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset',
+                        type=str,
+                        default='Eclair',
+                        help='dataset: USPTO50K')
+    parser.add_argument('--typed',
+                        action='store_true',
+                        default=False,
+                        help='if given reaction types')
+    args = parser.parse_args()
+
+
+    assert args.dataset in ['USPTO50K', 'USPTO-full', 'Eclair']
+    if args.typed:
+        args.output_suffix = '-aug-typed'
+    else:
+        args.output_suffix = '-aug-untyped'
+    print(args)
+
+    loaddir = 'data/{}/opennmt_data'.format(args.dataset)
+    savedir = 'data/{}/opennmt_data{}'.format(args.dataset, args.output_suffix)
+    if not os.path.exists(savedir):
+        os.mkdir(savedir)
+
+    src = {
+        'train': 'src-train-aug.txt',
+        'test': 'src-test.txt',
+        'valid': 'src-valid.txt',
+    }
+    tgt = {
+        'train': 'tgt-train-aug.txt',
+        'test': 'tgt-test.txt',
+        'valid': 'tgt-valid.txt',
+    }
+
+    tokens = Counter()
+    reaction_atoms = {}
+    reaction_atoms_list = []
+    for data_set in ['valid', 'train', 'test']:
+        with open(os.path.join(loaddir, src[data_set])) as f:
+            srcs = f.readlines()
+        with open(os.path.join(loaddir, tgt[data_set])) as f:
+            tgts = f.readlines()
+
+        src_lines = []
+        tgt_lines = []
+        reaction_atoms_lists = []
+        unknown = set()
+        for s, t in tqdm(list(zip(srcs, tgts))):
+            tgt_items = t.strip().split()
+            src_items = s.strip().split()
+            src_items[2] = smi_tokenizer(smarts2smiles(src_items[2]))
+            tokens.update(src_items[2].split(' '))
+            for idx in range(4, len(src_items)):
+                if src_items[idx] == '.':
+                    continue
+                src_items[idx] = smi_tokenizer(smarts2smiles(src_items[idx], canonical=False))
+                tokens.update(src_items[idx].split(' '))
+            for idx in range(len(tgt_items)):
+                if tgt_items[idx] == '.':
+                    continue
+                tgt_items[idx] = smi_tokenizer(smarts2smiles(tgt_items[idx]))
+                tokens.update(tgt_items[idx].split(' '))
+
+            if not args.typed:
+                src_items[1] = '[RXN_0]'
+
+            src_line = ' '.join(src_items[1:])
+            tgt_line = ' '.join(tgt_items)
+            src_lines.append(src_line + '\n')
+            tgt_lines.append(tgt_line + '\n')
+
+        src_file = os.path.join(savedir, src[data_set])
+        print('src_file:', src_file)
+        with open(src_file, 'w') as f:
+            f.writelines(src_lines)
+
+        tgt_file = os.path.join(savedir, tgt[data_set])
+        print('tgt_file:', tgt_file)
+        with open(tgt_file, 'w') as f:
+            f.writelines(tgt_lines)
+
+
+
+    ###################################################
+    ###################################################
+    # data.py
+    ###################################################
+    ###################################################
+import torch
+from torch.utils.data import Dataset
+import os
+import pickle
+import numpy as np
+import networkx as nx
+import dgl
+
+from collections import Counter
+
+
+class RetroCenterDatasets(Dataset):
+    def __init__(self, root, data_split, min_freq):
+        self.root = root
+        self.data_split = data_split
+
+        self.data_dir = os.path.join(root, self.data_split)
+        with open(os.path.join(self.data_dir, 'rxn_data_filtered_minfreq_%d.pkl' % min_freq), 'rb') as f:
+            self.rxn_data_dict = pickle.load(f)
+
+        self.disconnection_num = []
+        self.rxn_data_list = []
+        cnt = Counter()
+        for idx, reaction_data in self.rxn_data_dict.items():
+            xa = reaction_data['product_adj']
+            ya = reaction_data['target_adj']
+            res = xa & (ya == False)
+            res = np.sum(np.sum(res)) // 2
+            cnt[res] += 1
+            if res >= 2:
+                res = 2
+            self.disconnection_num.append(res)
+            self.rxn_data_list.append(reaction_data)
+        print(cnt)
+
+    def __getitem__(self, index):
+        reaction_data = self.rxn_data_list[index]
+
+        x_atom = reaction_data['product_atom_features'].astype(np.float32)
+        x_pattern_feat = reaction_data['pattern_feat'].astype(np.float32)
+        x_bond = reaction_data['product_bond_features'].astype(np.float32)
+        x_adj = reaction_data['product_adj']
+        y_adj = reaction_data['target_adj']
+        rxn_class = reaction_data['rxn_type']
+        rxn_class = np.eye(10)[rxn_class]
+        product_atom_num = len(x_atom)
+        rxn_class = np.expand_dims(rxn_class, 0).repeat(product_atom_num,
+                                                        axis=0)
+        disconnection_num = self.disconnection_num[index]
+        # Construct graph and add edge data
+        x_graph = dgl.DGLGraph(nx.from_numpy_matrix(x_adj))
+        x_graph.edata['w'] = x_bond[x_adj]
+        return rxn_class, x_pattern_feat, x_atom, x_adj, x_graph, y_adj, disconnection_num
+
+    def __len__(self):
+        return len(self.rxn_data_list)
+
+
+if __name__ == '__main__':
+    savedir = 'data/USPTO50K/'
+    for data_set in ['train', 'test', 'valid']:
+        save_dir = os.path.join(savedir, data_set)
+        train_data = RetroCenterDatasets(root=savedir, data_split=data_set,
+                                         min_freq=args.min_freq)
+        print(train_data.data_files[:100])
+
+
+
+    ###################################################
+    ###################################################
+    # preprocessing.py
+    ###################################################
+    ###################################################
+
+import numpy as np
+import pandas as pd
+import argparse
+import os
+import re
+import pickle
+import multiprocessing
+from collections import Counter
+
+from rdkit import Chem
+from tqdm import tqdm
+
+import sys
+sys.path.append('./util')
+from rdchiral.template_extractor import extract_from_reaction
+
+import signal
+from contextlib import contextmanager
+
+class TimeoutException(Exception): pass
+
+@contextmanager
+def time_limit(seconds):
+    def signal_handler(signum, frame):
+        raise TimeoutException("Timed out!")
+    signal.signal(signal.SIGALRM, signal_handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+
+
+# Get the mapping numbers in a SMILES.
+def get_idx(smarts):
+    item = re.findall('(?<=:)\d+', smarts)
+    item = list(map(int, item))
+    return item
+
+
+#  Get the dict maps each atom index to the mapping number.
+def get_atomidx2mapidx(mol):
+    atomidx2mapidx = {}
+    for atom in mol.GetAtoms():
+        atomidx2mapidx[atom.GetIdx()] = atom.GetAtomMapNum()
+    return atomidx2mapidx
+
+
+#  Get the dict maps each mapping number to the atom index .
+def get_mapidx2atomidx(mol):
+    mapidx2atomidx = {}
+    mapidx2atomidx[0] = []
+    for atom in mol.GetAtoms():
+        if atom.GetAtomMapNum() == 0:
+            mapidx2atomidx[0].append(atom.GetIdx())
+        else:
+            mapidx2atomidx[atom.GetAtomMapNum()] = atom.GetIdx()
+    return mapidx2atomidx
+
+
+# Get the reactant atom index list in the order of product atom index.
+def get_order(product_mol, patomidx2pmapidx, rmapidx2ratomidx):
+    order = []
+    for atom in product_mol.GetAtoms():
+        x = rmapidx2ratomidx[patomidx2pmapidx[atom.GetIdx()]]
+        order.append(x)
+    return order
+
+
+def get_onehot(item, item_list):
+    return list(map(lambda s: item == s, item_list))
+
+
+def get_symbol_onehot(symbol):
+    symbol_list = [
+        'C', 'N', 'O', 'S', 'F', 'H', 'Si', 'P', 'Cl', 'Br', 'Li', 'Na', 'K',
+        'Mg', 'B', 'Sn', 'I', 'Se', 'unk'
+    ]
+    if symbol not in symbol_list:
+        print(symbol)
+        symbol = 'unk'
+    return list(map(lambda s: symbol == s, symbol_list))
+
+
+def get_atom_feature(atom):
+    degree_onehot = get_onehot(atom.GetDegree(), [0, 1, 2, 3, 4, 5, 6])
+    H_num_onehot = get_onehot(atom.GetTotalNumHs(), [0, 1, 2, 3, 4])
+    formal_charge = get_onehot(atom.GetFormalCharge(), [-1, -2, 1, 2, 0])
+    chiral_tag = get_onehot(int(atom.GetChiralTag()), [0, 1, 2, 3])
+    hybridization = get_onehot(atom.GetHybridization(), [
+        Chem.rdchem.HybridizationType.SP, Chem.rdchem.HybridizationType.SP2,
+        Chem.rdchem.HybridizationType.SP3, Chem.rdchem.HybridizationType.SP3D,
+        Chem.rdchem.HybridizationType.SP3D2
+    ])
+    symbol_onehot = get_symbol_onehot(atom.GetSymbol())
+    # Atom mass scaled to about the same range as other features
+    atom_feature = degree_onehot + H_num_onehot + formal_charge + chiral_tag + hybridization + [
+        atom.GetIsAromatic()
+    ] + [atom.GetMass() * 0.01] + symbol_onehot
+    return atom_feature
+
+
+def get_atom_features(mol):
+    feats = []
+    for atom in mol.GetAtoms():
+        feats.append(get_atom_feature(atom))
+    return np.array(feats, dtype=np.float32)
+
+
+def get_int_bond_type(bond_type):
+    '''
+        bond_type: SINGLE 1, DOUBLE 2, TRIPLE 3, AROMATIC 4
+    '''
+    if int(bond_type) == 12:
+        return 4
+    else:
+        return int(bond_type)
+
+
+def get_bond_features(mol):
+    atom_num = len(mol.GetAtoms())
+    # Bond feature dim is 12
+    adj_array = np.zeros((atom_num, atom_num, 12), dtype=int)
+    for bond in mol.GetBonds():
+        bond_feat = bond_features(bond)
+        adj_array[bond.GetBeginAtomIdx()][bond.GetEndAtomIdx()] = bond_feat
+        adj_array[bond.GetEndAtomIdx()][bond.GetBeginAtomIdx()] = bond_feat
+    return adj_array.astype(np.bool)
+
+
+def bond_features(bond):
+    """
+    Builds a feature vector for a bond.
+    :param bond: A RDKit bond.
+    :return: A list containing the bond features.
+    """
+    bt = bond.GetBondType()
+    fbond = [
+        bt == Chem.rdchem.BondType.SINGLE, bt == Chem.rdchem.BondType.DOUBLE,
+        bt == Chem.rdchem.BondType.TRIPLE, bt == Chem.rdchem.BondType.AROMATIC,
+        (bond.GetIsConjugated() if bt is not None else 0),
+        (bond.IsInRing() if bt is not None else 0)
+    ]
+    fbond += get_onehot(int(bond.GetStereo()), list(range(6)))
+    return fbond
+
+
+def preprocess(save_dir, reactants, products, reaction_types=None):
+    """
+    preprocess reaction data to extract graph adjacency matrix and features
+    """
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    rxn_data = {}
+
+    for index in tqdm(range(len(products))):
+        product = products[index]
+        reactant = reactants[index]
+        product_mol = Chem.MolFromSmiles(product)
+        reactant_mol = Chem.MolFromSmiles(reactant)
+        product_smi = Chem.MolToSmiles(product_mol, canonical=False)
+        reactant_smi = Chem.MolToSmiles(reactant_mol, canonical=False)
+
+        product_adj = Chem.rdmolops.GetAdjacencyMatrix(product_mol)
+        product_adj = product_adj + np.eye(product_adj.shape[0])
+        product_adj = product_adj.astype(np.bool)
+        reactant_adj = Chem.rdmolops.GetAdjacencyMatrix(reactant_mol)
+        reactant_adj = reactant_adj + np.eye(reactant_adj.shape[0])
+        reactant_adj = reactant_adj.astype(np.bool)
+
+        patomidx2pmapidx = get_atomidx2mapidx(product_mol)
+        rmapidx2ratomidx = get_mapidx2atomidx(reactant_mol)
+        # Get indexes of reactant atoms without a mapping number
+        # growing_group_index = rmapidx2ratomidx[0]
+
+        # Get the reactant atom index list in the order of product atom index.
+        # print(reactant + '>>' + product)
+        order = get_order(product_mol, patomidx2pmapidx, rmapidx2ratomidx)
+        # print(reactant_adj.shape, order)
+        target_adj = reactant_adj[order][:, order]
+        # full_order = order + growing_group_index
+        # reactant_adj = reactant_adj[full_order][:, full_order]
+
+        product_bond_features = get_bond_features(product_mol)
+        product_atom_features = get_atom_features(product_mol)
+
+        rxn_data[index] = {
+            'rxn_type': reaction_types[index],
+            'product_adj': product_adj,
+            'product_mol': product_mol,
+            'product_smi': product_smi,
+            'product_bond_features': product_bond_features,
+            'product_atom_features': product_atom_features,
+            'target_adj': target_adj,
+            #'reactant_adj': reactant_adj,
+            #'reactant_in_product_order': full_order,
+            'reactant_mol': reactant_mol,
+            'reactant_smi': reactant_smi
+        }
+    with open(os.path.join(save_dir, 'rxn_data.pkl'), 'wb') as f:
+        pickle.dump(rxn_data, f)
+
+
+def get_tpl(task):
+    idx, react, prod = task
+    reaction = {'_id': idx, 'reactants': react, 'products': prod}
+    template = {}
+    try:
+        with time_limit(100):
+            template = extract_from_reaction(reaction, super_general=True)
+    except TimeoutException as e:
+        print(e)
+        pass
+    except:
+        print('unexpected error')
+        pass
+    # template = extract_from_reaction(reaction, super_general=True)
+    return idx, template
+
+
+def cano_smarts(smarts):
+    tmp = Chem.MolFromSmarts(smarts)
+    if tmp is None:
+        return None, smarts
+    [a.ClearProp('molAtomMapNumber') for a in tmp.GetAtoms()]
+    cano = Chem.MolToSmarts(tmp)
+    if '[[se]]' in cano:  # strange parse error
+        cano = smarts
+    return cano
+
+
+def find_all_patterns(task):
+    k, product_mol = task
+    [a.SetAtomMapNum(0) for a in product_mol.GetAtoms()]
+    matches_all = {}
+    for idx, pattern in enumerate(patterns_filtered):
+        pattern_mol = Chem.MolFromSmarts(pattern)
+        if pattern_mol is None:
+            print('error: pattern_mol is None')
+        try:
+            matches = product_mol.GetSubstructMatches(pattern_mol,
+                                                      useChirality=False)
+        except:
+            continue
+        else:
+            if len(matches) > 0 and len(matches[0]) > 0:
+                matches_all[idx] = matches
+    if len(matches_all) == 0:
+        print(product_mol)
+    num_atoms = product_mol.GetNumAtoms()
+    pattern_feature = np.zeros((len(patterns_filtered), num_atoms))
+    for idx, matches in matches_all.items():
+        if len(matches) > 1 and isinstance(matches[0], tuple):
+            for match in matches:
+                np.put(pattern_feature[idx], match, 1)
+        else:
+            np.put(pattern_feature[idx], matches, 1)
+    pattern_feature = pattern_feature.transpose().astype('bool_')
+    return k, pattern_feature
+
+
+# Split product smarts according to the target adjacent matrix
+def get_smarts_pieces(mol, src_adj, target_adj, reacts, add_bond=False):
+    m, n = src_adj.shape
+    emol = Chem.EditableMol(mol)
+    for j in range(m):
+        for k in range(j + 1, n):
+            if target_adj[j][k] == src_adj[j][k]:
+                continue
+            if 0 == target_adj[j][k]:
+                emol.RemoveBond(j, k)
+            elif add_bond:
+                emol.AddBond(j, k, Chem.rdchem.BondType.SINGLE)
+    synthon_smiles = Chem.MolToSmiles(emol.GetMol(), isomericSmiles=True)
+    synthons = synthon_smiles.split('.')
+    # Find the reactant with maximum common atoms for each synthon
+    syn_idx_list = [get_idx(synthon) for synthon in synthons]
+    react_idx_list = [get_idx(react) for react in reacts]
+
+    react_max_common_synthon_index = []
+    for react_idx in react_idx_list:
+        react_common_idx_cnt = []
+        for syn_idx in syn_idx_list:
+            common_idx = list(set(syn_idx) & set(react_idx))
+            react_common_idx_cnt.append(len(common_idx))
+        max_cnt = max(react_common_idx_cnt)
+        react_max_common_index = react_common_idx_cnt.index(max_cnt)
+        react_max_common_synthon_index.append(react_max_common_index)
+    react_synthon_index = np.argsort(react_max_common_synthon_index).tolist()
+    reacts = [reacts[k] for k in react_synthon_index]
+
+    return ' . '.join(synthons), ' . '.join(reacts)
+
+
+# Split product smarts into synthons, src seq is synthon and tgt seq is reaction data
+def generate_opennmt_data(save_dir, set_name, args):
+    assert set_name in ['train', 'test', 'valid']
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    
+    srcfpath = os.path.join(opennmtdatadir, 'src-{}.txt'.format(set_name))
+    tgtfpath = os.path.join(opennmtdatadir, 'tgt-{}.txt'.format(set_name))
+    if not os.path.exists(srcfpath) and not os.path.exists(tgtfpath):
+        src_data = []
+        tgt_data = []
+        rxn_data_file = os.path.join(
+            save_dir, 'rxn_data_filtered_minfreq_%d.pkl' % args.min_freq)
+        with open(rxn_data_file, 'rb') as f:
+            rxn_data_dict = pickle.load(f)
+        for idx, rxn_data in tqdm(rxn_data_dict.items()):
+            reaction_cls = rxn_data['rxn_type']
+            reactant_mol = rxn_data['reactant_mol']
+            product_mol = rxn_data['product_mol']
+            product_adj = rxn_data['product_adj']
+            target_adj = rxn_data['target_adj']
+            reactant = Chem.MolToSmiles(reactant_mol)
+            product = Chem.MolToSmiles(product_mol)
+            reactants = reactant.split('.')
+
+            src_item, tgt_item = get_smarts_pieces(product_mol, product_adj,
+                                                target_adj, reactants)
+            src_data.append([idx, reaction_cls, product, src_item])
+            tgt_data.append(tgt_item)
+
+        print('size', len(src_data))
+
+        # Write data with reaction index
+        with open(srcfpath, 'w') as f:
+            for src in src_data:
+                f.write('{} [RXN_{}] {} [PREDICT] {}\n'.format(
+                    src[0], src[1], src[2], src[3]))
+        
+        with open(tgtfpath, 'w') as f:
+            for tgt in tgt_data:
+                f.write('{}\n'.format(tgt))
+
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset',
+                        type=str,
+                        default='Eclair',
+                        help='dataset: USPTO50K or USPTO-full')
+    parser.add_argument('--min_freq',
+                        type=int,
+                        default=10,
+                        help='minimum frequency for patterns to be kept')
+    parser.add_argument('--typed',
+                        action='store_true',
+                        default=False,
+                        help='if given reaction types')
+
+    args = parser.parse_args()
+
+    print('preprocessing dataset {}...'.format(args.dataset))
+    assert args.dataset in ['USPTO50K', 'USPTO-full', 'Eclair']
+
+    datadir = 'data/{}/canonicalized_csv'.format(args.dataset)
+    savedir = 'data/{}/'.format(args.dataset)
+
+    for data_set in ['test', 'valid', 'train']:
+        save_dir = os.path.join(savedir, data_set)
+        if not os.path.exists(os.path.join(save_dir, 'rxn_data.pkl')):
+        
+            csv_path = os.path.join(datadir, data_set + '.csv')
+            csv = pd.read_csv(csv_path)
+            reaction_list = csv['rxn_smiles']
+            reactant_smarts_list = list(
+                map(lambda x: x.split('>>')[0], reaction_list))
+            product_smarts_list = list(
+                map(lambda x: x.split('>>')[1], reaction_list))
+            reaction_class_list = list(map(lambda x: 0, csv['class']))
+            # Extract product adjacency matrix and atom features
+            print('Creating', os.path.join(save_dir, 'rxn_data.pkl'), '...')
+        
+            preprocess(
+                save_dir,
+                reactant_smarts_list,
+                product_smarts_list,
+                reaction_class_list,
+            )
+        else:
+            print('Already exists. pass.')
+
+    ###################################################
+    n_pools = multiprocessing.cpu_count() - 1 #15 # 
+    print('n_pools: ', n_pools)
+    print("""
+    ###################################################
+    # extract semi template patterns from training data
+    ###################################################
+    """)
+    data_dir = os.path.join('./data', args.dataset, 'train')
+    pickle_fname = os.path.join(data_dir, 'tpl_data.pkl')
+    list_fname = os.path.join(data_dir, 'tpl_data.list')
+    if not os.path.exists(pickle_fname):
+        print('Pattern pkl file DOES NOT exist')
+        if not os.path.exists(list_fname):
+
+            print('load rxn data from', data_dir)
+            with open(os.path.join(data_dir, 'rxn_data.pkl'), 'rb') as f:
+                rxn_data_dict = pickle.load(f)
+
+            rxns = [(idx, rxn['reactant_smi'], rxn['product_smi']) 
+                    for idx, rxn in rxn_data_dict.items()]
+            print('total training rxns:', len(rxns))
+
+            pattern_list = []
+            pool = multiprocessing.Pool(n_pools)
+            for result in tqdm(pool.imap_unordered(get_tpl, rxns),
+                        total=len(rxns)):
+                idx, template = result
+
+                if 'reaction_smarts' not in template:
+                    continue
+                product_pattern = cano_smarts(template['products'])
+                pattern_list.append(product_pattern)
+                with open(list_fname, 'a+') as f:
+                    f.write(product_pattern + '\n')
+            exit(1)
+        else:
+            print('Pattern list file exists!')
+            with open(list_fname, 'r') as f:
+                pattern_list = [l.strip() for l in f.readlines()]
+        with open(os.path.join(data_dir, 'tpl_data.pkl'), 'wb') as f:
+            pickle.dump(pattern_list, f)
+        print('making template data pickle file FINISHED!')
+
+    else:
+        print('Pattern pkl file exists')
+
+    print("""
+    ###################################################
+    # Load and filter patterns
+    ###################################################
+    """)
+    pattern_file = os.path.join(
+        './data', args.dataset, 'product_patterns.txt')
+    if not os.path.exists(pattern_file):
+        if os.path.exists(pickle_fname):
+            with open(pickle_fname, 'rb') as f:
+                pattern_list = pickle.load(f)
+        else:
+            print('No pattern pkl file')
+            raise
+        print('patterns were extracted from pkl files.')
+        patterns = Counter(pattern_list)
+        patterns = sorted(
+            patterns.items(), key=lambda x: x[1], reverse=True)
+        patterns = ['{}: {}\n'.format(p[0], p[1]) for p in patterns]
+    
+        with open(pattern_file, 'w') as f:
+            f.writelines(patterns)
+
+    patterns_filtered = []
+    print('load semi template patterns from file:', pattern_file)
+    with open(pattern_file) as f:
+        patterns = f.readlines()
+    for p in patterns:
+        pa, cnt = p.strip().split(': ')
+        if int(cnt) >= args.min_freq:
+            patterns_filtered.append(pa)
+    print('total number of semi template patterns:', len(patterns_filtered))
+
+    print("""
+    ###################################################
+    # Extract product pattern features
+    ###################################################
+    """)
+    for data_set in ['train', 'valid', 'test']:
+        data_dir = os.path.join('./data', args.dataset, data_set)
+        rxn_data_file_included = os.path.join(
+            data_dir, 'rxn_data_filtered_minfreq_%d.pkl' % args.min_freq)
+        rxn_data_file_excluded = os.path.join(
+            data_dir, 'rxn_data_filtered_out_minfreq_%d.pkl' % args.min_freq)
+        
+        if not os.path.exists(rxn_data_file_included):
+            print('load rxn data from', data_dir)
+            with open(os.path.join(data_dir, 'rxn_data.pkl'), 'rb') as f:
+                rxn_data_dict = pickle.load(f)
+
+            features_dict = {}
+            pattern_features_pkl = os.path.join(data_dir, 'pattern_feature.pkl')
+            if not os.path.exists(pattern_features_pkl):
+                print('pattern feature pkl file does not exist')
+
+                tasks = [(idx, rxn['product_mol']) 
+                         for idx, rxn in rxn_data_dict.items()]
+                pool = multiprocessing.Pool(n_pools)
+                f = open(pattern_features_pkl, 'wb')
+                for result in tqdm(
+                            pool.imap_unordered(find_all_patterns, tasks),
+                            total=len(tasks)):
+                    k, pattern_feature = result
+                    features_dict[k] = feature
+                    pickle.dump((k, pattern_feature), f)
+                f.close()
+            else:
+                f = open(pattern_features_pkl, 'rb')
+                while True:
+                    try:
+                        k, feature = pickle.load(f)
+                        features_dict[k] = feature
+                    except EOFError:
+                        break
+                f.close()
+
+            rxn_data_dict_in = {}
+            rxn_data_dict_ex = {}
+            for idx, rxn in rxn_data_dict.items():
+                if idx in features_dict:
+                    rxn['pattern_feat'] = features_dict[idx].astype(np.bool)
+                    rxn_data_dict_in[idx] = rxn
+                else:
+                    rxn_data_dict_ex[idx] = rxn
+
+            with open(rxn_data_file_included, 'wb') as f:
+                pickle.dump(rxn_data_dict_in, f)
+            with open(rxn_data_file_excluded, 'wb') as f:
+                pickle.dump(rxn_data_dict_ex, f)
+
+    print("""
+    ###################################################
+    # Generate ONMT data
+    # ./data/*/opennmt_data/*.txt
+    ###################################################
+    """)
+
+    opennmtdatadir = \
+        'data/{}/opennmt_data'.format(args.dataset)
+    if not os.path.exists(opennmtdatadir):
+        os.mkdir(opennmtdatadir)
+
+    print('Creating ONMT datasets...')
+    for data_set in ['test', 'valid', 'train']:
+        print(data_set)
+        save_dir = os.path.join(savedir, data_set)
+        generate_opennmt_data(save_dir, data_set, args)
+
+    srcfpath = os.path.join(opennmtdatadir, 'src-train-aug.txt')
+    tgtfpath = os.path.join(opennmtdatadir, 'tgt-train-aug.txt')
+    if not os.path.exists(srcfpath) and not os.path.exists(tgtfpath):
+        # Data augmentation for training data
+        with open(os.path.join(opennmtdatadir, 'tgt-train.txt'), 'r') as f:
+            targets = [l.strip() for l in f.readlines()]
+        with open(os.path.join(opennmtdatadir, 'src-train.txt'), 'r') as f:
+            sources = [l.strip() for l in f.readlines()]
+        sources_new, targets_new = [], []
+        for src, tgt in zip(sources, targets):
+            sources_new.append(src)
+            targets_new.append(tgt)
+            src_produdct, src_synthon = src.split('[PREDICT]')
+            synthons = src_synthon.strip().split('.')
+            reactants = tgt.split('.')
+            if len(reactants) == 1:
+                continue
+            synthons.reverse()
+            reactants.reverse()
+            sources_new.append(src_produdct + ' [PREDICT] ' + ' . '.join(synthons))
+            targets_new.append(' . '.join(reactants))
+        with open(tgtfpath, 'w') as f:
+            for tgt in targets_new:
+                f.write(tgt.strip() + '\n')
+        with open(srcfpath, 'w') as f:
+            for src in sources_new:
+                f.write(src.strip() + '\n')
+
+
+    ###################################################
+    ###################################################
+    # inference.py
+    ###################################################
+    ###################################################
+
+
+
+import argparse
+import multiprocessing
+import pickle
+import os
+import sys
+from collections import Counter
+from tqdm import tqdm
+from rdkit import Chem
+import numpy as np
+import torch
+import dgl
+
+from preprocessing import (
+    get_atomidx2mapidx, get_bond_features, get_atom_feature, get_atom_features)
+from train import collate, GATNet, DataLoader
+from data import RetroCenterDatasets
+from prepare_data import smarts2smiles, smi_tokenizer
+from prepare_test_prediction import get_smarts_pieces
+
+
+def preprocess_product_only(save_dir, products, reaction_types=None):
+    """
+    preprocess reaction data to extract graph adjacency matrix and features
+    """
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    rxn_data = {}
+
+    for index in tqdm(range(len(products))):
+        product = products[index]
+        product_mol = Chem.MolFromSmiles(product)
+
+        product_adj = Chem.rdmolops.GetAdjacencyMatrix(product_mol)
+        product_adj = product_adj + np.eye(product_adj.shape[0])
+        product_adj = product_adj.astype(np.bool)
+
+        patomidx2pmapidx = get_atomidx2mapidx(product_mol)
+
+        product_bond_features = get_bond_features(product_mol)
+        product_atom_features = get_atom_features(product_mol)
+
+        rxn_data[index] = {
+            'rxn_type': reaction_types[index],
+            'product_adj': product_adj,
+            'product_mol': product_mol,
+            'product_bond_features': product_bond_features,
+            'product_atom_features': product_atom_features}
+    with open(os.path.join(save_dir, 'rxn_data.pkl'), 'wb') as f:
+        pickle.dump(rxn_data, f)
+
+
+def generate_opennmt_data_test_only(save_dir, opennmtdatadir):
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    src_data = []
+    with open(os.path.join(save_dir, 'rxn_data.pkl'), 'rb') as f:
+        rxn_data_dict = pickle.load(f)
+    for idx, rxn_data in tqdm(rxn_data_dict.items()):
+        reaction_cls = rxn_data['rxn_type']
+        product_mol = rxn_data['product_mol']
+        product_adj = rxn_data['product_adj']
+        product = Chem.MolToSmiles(product_mol)
+
+        src_data.append([idx, reaction_cls, product, product])
+
+    print('size', len(src_data))
+
+    # Write data with reaction index
+    src_data_path = os.path.join(opennmtdatadir, 'src-test.txt')
+    with open(src_data_path, 'w') as f:
+        for src in src_data:
+            f.write('{} [RXN_{}] {} [PREDICT] {}\n'.format(
+                src[0], src[1], src[2], src[3]))
+
+
+def find_all_patterns_test_only(k, product_mol, patterns_filtered):
+    [a.SetAtomMapNum(0) for a in product_mol.GetAtoms()]
+    matches_all = {}
+    for idx, pattern in enumerate(patterns_filtered):
+        pattern_mol = Chem.MolFromSmarts(pattern)
+        if pattern_mol is None:
+            print('error: pattern_mol is None')
+        try:
+            matches = product_mol.GetSubstructMatches(
+                pattern_mol, useChirality=False)
+        except:
+            continue
+        else:
+            if len(matches) > 0 and len(matches[0]) > 0:
+                matches_all[idx] = matches
+    if len(matches_all) == 0:
+        print(product_mol)
+    num_atoms = product_mol.GetNumAtoms()
+    pattern_feature = np.zeros((len(patterns_filtered), num_atoms))
+    for idx, matches in matches_all.items():
+        if len(matches) > 1 and isinstance(matches[0], tuple):
+            for match in matches:
+                np.put(pattern_feature[idx], match, 1)
+        else:
+            np.put(pattern_feature[idx], matches, 1)
+    pattern_feature = pattern_feature.transpose().astype('bool_')
+    return k, pattern_feature
+
+
+def test_product_only(GAT_model, test_dataloader, args, save_pred=False):
+    GAT_model.eval()
+    total = 0.
+    epoch_loss = 0.
+    # Bond disconnection probability
+    pred_logits_mol_list = []
+    # Bond disconnection number gt and prediction
+    bond_change_pred_list = []
+    for i, data in enumerate(tqdm(test_dataloader)):
+        rxn_class, x_pattern_feat, x_atom, x_adj, x_graph, _, disconnection_num = data
+
+        x_atom = list(map(lambda x: torch.from_numpy(x).float(), x_atom))
+        x_pattern_feat = list(
+            map(lambda x: torch.from_numpy(x).float(), x_pattern_feat))
+        x_atom = list(
+            map(lambda x, y: torch.cat([x, y], dim=1), x_atom, x_pattern_feat))
+
+        x_atom = torch.cat(x_atom, dim=0)
+        disconnection_num = torch.LongTensor(disconnection_num)
+        if not args.use_cpu:
+            x_atom = x_atom.cuda()
+            disconnection_num = disconnection_num.cuda()
+
+        x_adj = list(map(lambda x: torch.from_numpy(np.array(x)), x_adj))
+        if not args.use_cpu:
+            x_adj = [xa.cuda() for xa in x_adj]
+
+        # batch graph
+        g_dgl = dgl.batch(x_graph)
+        h_pred, e_pred = GAT_model(g_dgl, x_atom)
+        e_pred = e_pred.squeeze()
+
+        h_pred = torch.argmax(h_pred, dim=1)
+        bond_change_pred_list.extend(h_pred.cpu().tolist())
+
+        start = end = 0
+        pred = torch.sigmoid(e_pred)
+        edge_lens = [x.sum().cpu().numpy() for x in x_adj]
+        cur_batch_size = len(edge_lens)
+        
+        for j in range(cur_batch_size):
+            start = end
+            end += edge_lens[j]
+            pred_proab = pred[start:end]
+            mask_pos = torch.nonzero(x_adj[j]).tolist()
+            assert len(mask_pos) == len(pred_proab)
+
+            pred_disconnection_adj = torch.zeros_like(x_adj[j], dtype=torch.float32)
+            for idx, pos in enumerate(mask_pos):
+                pred_disconnection_adj[pos[0], pos[1]] = pred_proab[idx]
+            for idx, pos in enumerate(mask_pos):
+                pred_proab[idx] = (pred_disconnection_adj[pos[0], pos[1]] + pred_disconnection_adj[pos[1], pos[0]]) / 2
+
+            pred_mol = pred_proab.round().long()
+            pred_logits_mol_list.append([
+                False,
+                'Label N/A',
+                pred_proab.tolist(),
+            ])
+            total += 1
+
+    if save_pred:
+        if not os.path.exists('logs/TEST/'):
+            os.mkdir('logs/TEST/')
+        np.savetxt('logs/TEST/test_disconnection_TEST.txt',
+                   np.asarray(bond_change_pred_list),
+                   fmt='%d')
+        with open('logs/TEST/test_result_mol_TEST.txt', 'w') as f:
+            for idx, line in enumerate(pred_logits_mol_list):
+                f.write('{} {}\n'.format(idx, line[0]))
+                f.write(' '.join([str(i) for i in line[1]]) + '\n')
+                f.write(' '.join([str(i) for i in line[2]]) + '\n')
+    print('TEST fin.')
+
+
+class RetroCenterDatasetsTest(RetroCenterDatasets):
+    def __init__(self, root, data_split, min_freq):
+        self.root = root
+        self.data_split = data_split
+
+        self.data_dir = os.path.join(root, self.data_split)
+        with open(os.path.join(self.data_dir, 'rxn_data_filtered_minfreq_%d.pkl' % min_freq), 'rb') as f:
+            self.rxn_data_dict = pickle.load(f)
+
+        self.disconnection_num = []
+        self.rxn_data_list = []
+        cnt = Counter()
+        for idx, reaction_data in self.rxn_data_dict.items():
+            xa = reaction_data['product_adj']
+            reaction_data['target_adj'] = 0
+            res = xa
+            res = np.sum(np.sum(res)) // 2
+            cnt[res] += 1
+            if res >= 2:
+                res = 2
+            self.disconnection_num.append(res)
+            self.rxn_data_list.append(reaction_data)
+        print(cnt)
+
+
+def atom_numbering(smi):
+    mol = Chem.MolFromSmiles(smi)
+    n = 1
+    for a in mol.GetAtoms():
+        a.SetAtomMapNum(n)
+        n += 1
+    return Chem.MolToSmiles(mol, True)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--min_freq',
+                        type=int,
+                        default=10,
+                        help='minimum frequency for patterns to be kept')
+    parser.add_argument('--dataset', 
+                        type=str, 
+                        default='Eclair', 
+                        help='dataset')
+    parser.add_argument('--in_dim',
+                        type=int,
+                        default=1304,  # Eclair
+                        help='dim of atom feature')
+
+    parser.add_argument('--batch_size',
+                        type=int,
+                        default=32,
+                        help='input batch size for training (default: 128)')
+    parser.add_argument('--hidden_dim', 
+                        type=int, 
+                        default=128, 
+                        help='hidden_dim')
+    parser.add_argument('--heads', 
+                        type=int, 
+                        default=4, 
+                        help='number of heads')
+    parser.add_argument('--gat_layers',
+                        type=int,
+                        default=3,
+                        help='number of gat layers')
+    parser.add_argument('--typed',
+                        action='store_true',
+                        default=False,
+                        help='if given reaction types')
+    parser.add_argument('--use_cpu',
+                        action='store_true',
+                        default=False,
+                        help='use gpu or cpu')
+
+    args = parser.parse_args()
+
+    ###################################################
+    # preprocessing.py
+    ###################################################
+
+    print('preprocessing TEST dataset...')
+    datadir = 'data/TEST/canonicalized_csv'
+    savedir = 'data/TEST/'
+
+    os.makedirs(datadir, exist_ok=True)
+
+    os.system('cp ./examples.txt ./data/TEST/canonicalized_csv/test.csv')    
+
+    
+    save_dir = os.path.join(savedir, 'test')
+    with open(os.path.join(datadir, 'test' + '.csv'), 'r') as f:
+        lines = f.readlines()
+    product_list = [l.strip() for l in lines]
+    product_smarts_list = [atom_numbering(p) for p in product_list]
+    reaction_class_list = [0] * len(product_list)
+    # Extract product adjacency matrix and atom features
+    print('Creating', os.path.join(save_dir, 'rxn_data.pkl'), '...')
+    if not os.path.exists(os.path.join(save_dir, 'rxn_data.pkl')):
+        preprocess_product_only(
+            save_dir,
+            product_smarts_list,
+            reaction_class_list,
+        )
+    else:
+        print('Already exists. pass.')
+
+    print('Creating ONMT datasets...')
+    save_dir = os.path.join(savedir, 'test')
+    opennmtdatadir = 'data/TEST/opennmt_data'
+    if not os.path.exists(opennmtdatadir):
+        os.mkdir(opennmtdatadir)
+    generate_opennmt_data_test_only(save_dir, opennmtdatadir)
+
+    ###################################################
+    # extract_semi_template_pattern.py
+    ###################################################
+
+    patterns_filtered = []
+    pattern_file = os.path.join('./data', args.dataset, 'product_patterns.txt')
+    
+    print('load semi template patterns from file:', pattern_file)
+    with open(pattern_file) as f:
+        patterns = f.readlines()
+    for p in patterns:
+        pa, cnt = p.strip().split(': ')
+        if int(cnt) >= args.min_freq:
+            patterns_filtered.append(pa)
+    print('total number of semi template patterns:', len(patterns_filtered))
+
+    n_pools = multiprocessing.cpu_count() - 1
+    print('n_pools: ', n_pools)
+
+    data_dir = os.path.join('./data/TEST/test')
+
+    print('load rxn data from', data_dir)
+    with open(os.path.join(data_dir, 'rxn_data.pkl'), 'rb') as f:
+        rxn_data_dict = pickle.load(f)
+
+    pattern_list = []
+    for idx, rxn in rxn_data_dict.items():
+        idx, pattern_feature = find_all_patterns_test_only(
+            idx, rxn['product_mol'], patterns_filtered)
+        pattern_list.append((idx, pattern_feature))
+        rxn_data_dict[idx]['pattern_feat'] = pattern_feature.astype(np.bool)
+
+    n_deleted = 0
+    filtered_rxn_data_dict = {}
+    for k in rxn_data_dict.keys():
+        if 'pattern_feat' in rxn_data_dict[k]:
+            filtered_rxn_data_dict[k] = rxn_data_dict[k]
+        else:
+            n_deleted += 1
+            print('Delete', rxn_data_dict[k])
+
+
+    print('# deleted reaction: %d' %n_deleted)
+
+    with open(os.path.join(data_dir, 
+                'rxn_data_filtered_minfreq_%d.pkl' % args.min_freq), 'wb') as f:
+        pickle.dump(rxn_data_dict, f)
+
+    ###################################################
+    # train.py
+    ###################################################
+
+    data_root = './data/TEST'
+    args.exp_name = args.dataset
+    if args.typed:
+        args.in_dim += 10
+        args.exp_name += '_typed'
+    else:
+        args.exp_name += '_untyped'
+
+    GAT_model = GATNet(
+        in_dim=args.in_dim,
+        num_layers=args.gat_layers,
+        hidden_dim=args.hidden_dim,
+        heads=args.heads,
+        use_gpu=(args.use_cpu == False),
+    )
+
+    if args.use_cpu:
+        device = 'cpu'
+    else:
+        GAT_model = GAT_model.cuda()
+        device = 'cuda:0'
+
+    GAT_model.load_state_dict(
+        torch.load('checkpoints/{}_checkpoint.pt'
+                   .format(args.exp_name),
+                   map_location=torch.device(device)), )
+
+    test_data = RetroCenterDatasetsTest(root=data_root, data_split='test', 
+                                        min_freq=args.min_freq)
+    test_dataloader = DataLoader(test_data,
+                                    batch_size=4 * args.batch_size,
+                                    shuffle=False,
+                                    num_workers=0,
+                                    collate_fn=collate)
+    test_product_only(GAT_model, test_dataloader, args, save_pred=True)
+
+    ###################################################
+    # prepare_data.py
+    ###################################################
+    if args.typed:
+        args.output_suffix = '-aug-typed'
+    else:
+        args.output_suffix = '-aug-untyped'
+
+    savedir = './data/TEST'
+    if not os.path.exists(savedir):
+        os.mkdir(savedir)
+
+    tokens = Counter()
+    
+    with open('./data/TEST/opennmt_data/src-test.txt') as f:
+        srcs = f.readlines()
+
+    src_lines = []
+    unknown = set()
+    for s in tqdm(srcs):
+        src_items = s.strip().split()
+        src_items[2] = smi_tokenizer(smarts2smiles(src_items[2]))
+        tokens.update(src_items[2].split(' '))
+        for idx in range(4, len(src_items)):
+            if src_items[idx] == '.':
+                continue
+            src_items[idx] = smi_tokenizer(smarts2smiles(src_items[idx], canonical=False))
+            tokens.update(src_items[idx].split(' '))
+        
+        if not args.typed:
+            src_items[1] = '[RXN_0]'
+
+        src_line = ' '.join(src_items[1:])
+        src_lines.append(src_line + '\n')
+        
+    src_file = os.path.join(savedir, 'src-test.txt')
+    print('src_file:', src_file)
+    with open(src_file, 'w') as f:
+        f.writelines(src_lines)
+
+
+    ###################################################
+    # prepare_test_prediction.py
+    ###################################################
+
+    pred_results = 'logs/TEST/test_result_mol_TEST.txt'
+    with open(pred_results) as f:
+        pred_results = f.readlines()
+
+    bond_pred_results = 'logs/TEST/test_disconnection_TEST.txt'
+    with open(bond_pred_results) as f:
+        bond_pred_results = f.readlines()
+
+    dataset_dir = 'data/TEST/test'
+
+    print('load rxn data from', dataset_dir)
+    with open(os.path.join(dataset_dir, 'rxn_data_filtered_minfreq_%d.pkl' % args.min_freq), 'rb') as f:
+        rxn_data_dict = pickle.load(f)
+
+    product_adjs = []
+    product_mols = []
+    product_smiles = []
+    for _, reaction_data in tqdm(rxn_data_dict.items()):
+        product_adjs.append(reaction_data['product_adj'])
+        product_mols.append(reaction_data['product_mol'])
+        product_smiles.append(Chem.MolToSmiles(reaction_data['product_mol'], canonical=False))
+
+    assert len(product_smiles) == len(bond_pred_results)
+
+    bond_disconnection = []
+    for i in range(len(bond_pred_results)):
+        bond_pred_items = bond_pred_results[i].strip().split()
+        bond_change_num = int(bond_pred_items[0]) * 2
+
+        pred_adj_list = pred_results[3 * i + 2].strip().split(' ')
+        pred_adj_list = [float(k) for k in pred_adj_list]
+        pred_adj_index = np.argsort(pred_adj_list)
+        pred_adj_index = pred_adj_index[:bond_change_num]
+
+        bond_disconnection.append(pred_adj_index)
+
+    print('bond_disconnection len:', len(bond_disconnection))
+
+    # Generate synthons from bond disconnection prediction
+    synthons = []
+    for i, prod_adj in enumerate(product_adjs):
+        x_adj = np.array(prod_adj)
+        # find 1 index
+        idxes = np.argwhere(x_adj > 0)
+        pred_adj = prod_adj.copy()
+        for k in bond_disconnection[i]:
+            idx = idxes[k]
+            assert pred_adj[idx[0], idx[1]] == 1
+            pred_adj[idx[0], idx[1]] = 0
+
+        pred_synthon = get_smarts_pieces(product_mols[i], prod_adj, pred_adj)
+        synthons.append(pred_synthon)
+
+    with open('./data/TEST/opennmt_data/src-test.txt') as f:
+        srcs = f.readlines()
+    assert len(synthons) == len(srcs)
+
+    savedir = './data/TEST/'
+    src_test_prediction = os.path.join(savedir, 'src-test-prediction.txt')
+    print('save src_test_prediction:', src_test_prediction)
+    with open(src_test_prediction, 'w') as f:
+        for src, synthon in zip(srcs, synthons):
+            src_items = src.split(' ')
+            src_items[2] = smi_tokenizer(smarts2smiles(src_items[2]))
+            if args.typed == 'untyped':
+                src_items[1] = '[RXN_0]'
+
+            syns = synthon.split('.')
+            syns = [smarts2smiles(s, canonical=False) for s in syns]
+            syns = [smi_tokenizer(s) for s in syns]
+            src_line = ' '.join(src_items[1:4]) + ' ' + ' . '.join(syns) + '\n'
+            f.write(src_line)
